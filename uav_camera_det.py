@@ -38,6 +38,9 @@ class ImageSubscriber(Node):
       
     # Used to convert between ROS and OpenCV images
     self.br = CvBridge()
+
+    # Create a resizable window
+    cv2.namedWindow('Detected Frame', cv2.WINDOW_NORMAL)
    
   def listener_callback(self, data):
     """

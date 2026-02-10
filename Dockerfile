@@ -80,8 +80,8 @@ COPY models/. /root/.gz/models/
 COPY models_docker/. /root/.gz/fuel/fuel.ignitionrobotics.org/openrobotics/models/
 COPY worlds/default_docker.sdf /root/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf
 
-# Modify camera angle
-RUN sed -i 's|<pose>.12 .03 .242 0 0 0</pose>|<pose>.15 .029 .21 0 0.7854 0</pose>|' /root/PX4-Autopilot/Tools/simulation/gz/models/x500_depth/model.sdf
+# Setup gimbal joints for camera control
+RUN python3 /root/PX4-ROS2-Gazebo-YOLOv8/setup_gimbal.py
 
 # Additional Configs
 RUN echo "source /root/ws_sensor_combined/install/setup.bash" >> /root/.bashrc && \
