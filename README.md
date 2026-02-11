@@ -33,7 +33,7 @@ xhost +local:docker
 
 ### Build and Run (ArduPilot)
 ```commandline
-git clone https://github.com/monemati/PX4-ROS2-Gazebo-YOLOv8.git
+git clone https://github.com/farshidrayhancv/PX4-ROS2-Gazebo-YOLOv8.git
 cd PX4-ROS2-Gazebo-YOLOv8
 bash run_ardupilot.sh
 ```
