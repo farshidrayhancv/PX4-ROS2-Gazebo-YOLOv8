@@ -1,6 +1,6 @@
 # PX4-ROS2-Gazebo-YOLOv8
 
-Aerial Object Detection using a Drone with PX4 Autopilot or ArduPilot, ROS 2, Gazebo Garden, and YOLOv8.
+Aerial Object Detection using a Drone with PX4 Autopilot or ArduPilot, ROS 2, Gazebo Garden, and YOLOv8. Includes a vision-based autonomous lane-keeping car on Sonoma Raceway.
 
 Two autopilot stacks are supported — choose based on your hardware:
 - **ArduPilot/ArduCopter** — for Pixhawk 6X/6C (STM32H753 @ 480 MHz) and other ArduCopter hardware
@@ -14,9 +14,26 @@ https://github.com/monemati/PX4-ROS2-Gazebo-YOLOv8/assets/58460889/fab19f49-0be6
 - 3-axis gimbal camera control (pitch, yaw, roll)
 - ArduCopter flight mode switching (Loiter, AltHold, Guided, Stabilize, Land)
 - YOLOv8 real-time object detection (persons and cars)
-- Moving car target for tracking demonstrations
+- **Vision-based lane keeping** — hatchback car autonomously drives Sonoma Raceway using camera + OpenCV
 - Tmuxinator orchestration — all services in a single tiled-pane window
 - Docker with GPU passthrough and X11 forwarding
+
+## Lane Keeping
+
+The hatchback car on Sonoma Raceway drives itself using a forward-facing camera and OpenCV-based yellow lane detection. No waypoints or pre-mapped paths — pure vision.
+
+**How it works:**
+- HSV thresholding detects yellow lane lines from the car's camera (640x480 @ 15Hz, 120° FOV)
+- Near-field classification (bottom half of image) prevents lane misdetection in sharp curves
+- Adaptive PID controller: gain scales quadratically with lane proximity — gentle on straights, aggressive near walls
+- Road curvature feedforward: averages both lane angles to steer into curves even when centered
+- Trend steering: slow-moving average remembers the turn direction so the car doesn't straighten out when lanes temporarily vanish
+- Merge detection: when both lanes converge (on-ramp merge), the car steers right for 2 seconds then resumes normal lane keeping
+- Speed control: 2.5–5.0 m/s, exponential ramp-up on straights, drops during corrections, crawls at 1 m/s with no lanes
+
+**Debug output:**
+- OpenCV window with lane overlay, danger scores, steering angle, speed, and frame number
+- CSV log at `/tmp/lane_keeping_log.csv` with per-frame telemetry
 
 ## Docker
 
@@ -59,10 +76,11 @@ See [How_to_run.md](How_to_run.md) for the full `docker run` commands if you nee
 |------|---------|
 | 1 | Micro XRCE-DDS Agent |
 | 2 | PX4 SITL (x500_depth drone) |
-| 3 | ROS-Gazebo camera bridge |
+| 3 | ROS-Gazebo drone camera bridge |
 | 4 | YOLOv8 detection display |
-| 5 | Moving car (hatchback driving in circles) |
-| 6 | Keyboard drone controller |
+| 5 | ROS-Gazebo car camera + cmd_vel bridges |
+| 6 | Lane keeping (autonomous car) |
+| 7 | Keyboard drone controller |
 
 Switch between panes with `Ctrl+b` then arrow keys.
 
@@ -253,7 +271,7 @@ cd ~/PX4-Autopilot
 PX4_SYS_AUTOSTART=4002 PX4_GZ_MODEL_POSE="268.08,-128.22,3.86,0.00,0,-0.7" \
   PX4_GZ_MODEL=x500_depth ./build/px4_sitl_default/bin/px4
 
-# Terminal 3: Camera bridge
+# Terminal 3: Drone camera bridge
 ros2 run ros_gz_bridge parameter_bridge \
   /world/default/model/x500_depth_0/link/camera_link/sensor/IMX214/image@sensor_msgs/msg/Image[gz.msgs.Image \
   --ros-args -r /world/default/model/x500_depth_0/link/camera_link/sensor/IMX214/image:=/camera
@@ -261,10 +279,16 @@ ros2 run ros_gz_bridge parameter_bridge \
 # Terminal 4: YOLOv8 detection
 cd ~/PX4-ROS2-Gazebo-YOLOv8 && python uav_camera_det.py
 
-# Terminal 5: Moving car
-cd ~/PX4-ROS2-Gazebo-YOLOv8 && python move_car.py
+# Terminal 5: Car camera + cmd_vel bridges
+ros2 run ros_gz_bridge parameter_bridge \
+  /car/camera@sensor_msgs/msg/Image[gz.msgs.Image \
+  '/model/hatchback_blue_1/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist' \
+  --ros-args -r /car/camera:=/car_camera
 
-# Terminal 6: Keyboard controller
+# Terminal 6: Lane keeping (autonomous car)
+cd ~/PX4-ROS2-Gazebo-YOLOv8 && python lane_keeping.py
+
+# Terminal 7: Keyboard controller
 cd ~/PX4-ROS2-Gazebo-YOLOv8 && python keyboard-mavsdk-test.py
 ```
 
@@ -279,7 +303,8 @@ cd ~/PX4-ROS2-Gazebo-YOLOv8 && python keyboard-mavsdk-test.py
 | `keyboard-mavsdk-test.py` | Keyboard flight control, gimbal, and mode switching |
 | `KeyPressModule.py` | Terminal keyboard input handler |
 | `uav_camera_det.py` | ROS 2 YOLOv8 detection node |
-| `move_car.py` | Drives hatchback in circles for tracking |
+| `lane_keeping.py` | Vision-based autonomous lane keeping for PX4 |
+| `move_car.py` | Drives hatchback in circles for drone tracking (ArduPilot only) |
 | `setup_gimbal_ardupilot.py` | Configures gimbal camera for ArduPilot iris model |
 | `setup_gimbal.py` | Configures gimbal camera for PX4 x500_depth model |
 | `ardupilot_ros2_gazebo.yml` | Tmuxinator config (ArduPilot) |
