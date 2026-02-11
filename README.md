@@ -1,31 +1,59 @@
 # PX4-ROS2-Gazebo-YOLOv8
-Aerial Object Detection using a Drone with PX4/Ardupilot Autopilot and ROS 2. PX4 SITL and Gazebo Garden used for Simulation. YOLOv8 used for Object Detection.
+
+Aerial Object Detection using a Drone with PX4 Autopilot or ArduPilot, ROS 2, Gazebo Garden, and YOLOv8.
+
+Two autopilot stacks are supported — choose based on your hardware:
+- **ArduPilot/ArduCopter** — for Pixhawk 6X/6C (STM32H753 @ 480 MHz) and other ArduCopter hardware
+- **PX4 Autopilot** — for PX4-based flight controllers
 
 ## Demo
 https://github.com/monemati/PX4-ROS2-Gazebo-YOLOv8/assets/58460889/fab19f49-0be6-43ea-a4e4-8e9bc8d59af9
 
+## Features
+- Keyboard-controlled drone flight (WASD + arrow keys) via MAVSDK
+- 3-axis gimbal camera control (pitch, yaw, roll)
+- ArduCopter flight mode switching (Loiter, AltHold, Guided, Stabilize, Land)
+- YOLOv8 real-time object detection (persons and cars)
+- Moving car target for tracking demonstrations
+- Tmuxinator orchestration — all services in a single tiled-pane window
+- Docker with GPU passthrough and X11 forwarding
+
 ## Docker
-- You can pull the already built image by me or use the provided Dockerfile.
-```commandline
-xhost +local:docker
-```
 
-- You can build custom docker image using the provided Dockerfile, already tested with the v1.15.0 version of PX4-Autopilot.
-```commandline
-# Build
-git clone https://github.com/monemati/PX4-ROS2-Gazebo-YOLOv8.git
+Two Dockerfiles are provided:
+- `Dockerfile` — ArduPilot/ArduCopter (default)
+- `Dockerfile.px4` — PX4 Autopilot
+
+### ArduPilot (default)
+```bash
+git clone https://github.com/farshidrayhancv/PX4-ROS2-Gazebo-YOLOv8.git
 cd PX4-ROS2-Gazebo-YOLOv8
-docker build -t px4_ros2_gazebo_yolov8_image .
-
-# Run
-XAUTH=/tmp/.docker.xauth
-touch $XAUTH
-xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f $XAUTH nmerge -
-docker run --privileged -it --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all -e NVIDIA_VISIBLE_DEVICES=all --volume="/tmp/.X11-unix:/tmp/.X11-unix:rw" --env="XAUTHORITY=$XAUTH" --volume="$XAUTH:$XAUTH" --network=host --ipc=host --shm-size=2gb --env="DISPLAY=$DISPLAY" --env="QT_X11_NO_MITSHM=1" --rm --name px4_ros2_gazebo_yolov8_container px4_ros2_gazebo_yolov8_image
+bash run_ardupilot.sh
 ```
+
+### PX4
+```bash
+git clone https://github.com/farshidrayhancv/PX4-ROS2-Gazebo-YOLOv8.git
+cd PX4-ROS2-Gazebo-YOLOv8
+bash run_px4.sh
+```
+
+See [How_to_run.md](How_to_run.md) for the full `docker run` commands if you need to customize flags.
 
 ### What Launches in Docker
-The container starts a single tmux window with 6 tiled panes:
+
+**ArduPilot** (`Dockerfile` / `run_ardupilot.sh`):
+
+| Pane | Service |
+|------|---------|
+| 1 | Gazebo Garden simulator |
+| 2 | ArduCopter SITL (iris drone with gimbal) |
+| 3 | ROS-Gazebo camera bridge |
+| 4 | YOLOv8 detection display |
+| 5 | Moving car (hatchback driving in circles) |
+| 6 | Keyboard drone controller |
+
+**PX4** (`Dockerfile.px4` / `run_px4.sh`):
 
 | Pane | Service |
 |------|---------|
@@ -40,8 +68,6 @@ Switch between panes with `Ctrl+b` then arrow keys.
 
 ## Keyboard Controls
 
-All keyboard input is handled directly in the terminal (no separate window needed).
-
 ### Flight Controls
 | Key | Action |
 |-----|--------|
@@ -53,41 +79,62 @@ All keyboard input is handled directly in the terminal (no separate window neede
 | `i` | Print flight mode |
 | `Ctrl+C` | Quit |
 
+### Flight Mode Switching (ArduCopter)
+| Key | Mode |
+|-----|------|
+| `1` | Loiter (position hold) |
+| `2` | AltHold (altitude hold) |
+| `3` | Guided (autonomous control) |
+| `4` | Stabilize (manual) |
+| `5` | Land |
+
 ### Gimbal Camera Controls
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Gimbal pitch down / up |
 | `n` / `m` | Gimbal yaw left / right |
 
-The camera starts at 45 degrees downward. Pitch range: -90 to +30 degrees. Yaw range: -90 to +90 degrees.
+## Architecture
 
-## Gimbal Camera System
+### ArduPilot Stack
+```
+ArduCopter SITL  <-- JSON/UDP -->  ardupilot_gazebo plugin  <-->  Gazebo Garden
+      |                                                              |
+      | MAVLink (UDP 14550)                                gz.msgs.Image
+      |                                                              |
+   MAVSDK Python                                          ROS-GZ bridge
+   pymavlink (UDP 14560)                                        |
+      |                                                  /camera (ROS 2)
+keyboard-mavsdk-test.py                                         |
+                                                      uav_camera_det.py (YOLOv8)
+```
 
-The drone's camera is mounted on a 2-axis gimbal with pitch and yaw control. During Docker build, `setup_gimbal.py` modifies the x500_depth drone model SDF to replace the fixed camera joint with:
+### PX4 Stack
+```
+PX4 SITL  <-->  Gazebo Garden (in-process plugin)
+    |                    |
+Micro XRCE-DDS      Camera sensor
+    |                    |
+px4_msgs (ROS 2)    ROS-GZ bridge
+    |                    |
+MAVSDK Python     /camera (ROS 2)
+    |                    |
+keyboard-mavsdk-test.py  uav_camera_det.py (YOLOv8)
+```
 
-- **gimbal_yaw_joint**: Revolute joint around the Z axis (base_link to gimbal_link)
-- **gimbal_pitch_joint**: Revolute joint around the Y axis (gimbal_link to camera_link)
+## Manual Installation
 
-Each joint is controlled by a `JointPositionController` plugin responding to Gazebo transport topics:
-- `/gimbal/cmd_pitch` — pitch angle command
-- `/gimbal/cmd_yaw` — yaw angle command
+### ArduPilot
 
-## Moving Car
-
-`move_car.py` drives the `hatchback_blue_1` model in a circle within the simulation using `gz service /world/default/set_pose`. This provides a moving target for the YOLOv8 detection system to track.
-
-## Manual Installation (ArduPilot)
-### Create a virtual environment
-```commandline
+```bash
+# Virtual environment
 python -m venv ~/ardupilot-venv
 source ~/ardupilot-venv/bin/activate
-```
-### Clone repository
-```commandline
-git clone https://github.com/monemati/PX4-ROS2-Gazebo-YOLOv8.git
-```
-### Install ArduPilot
-```commandline
+
+# Clone this repo
+git clone https://github.com/farshidrayhancv/PX4-ROS2-Gazebo-YOLOv8.git
+
+# ArduPilot
 cd ~
 git clone --recurse-submodules https://github.com/ArduPilot/ardupilot.git
 cd ardupilot
@@ -95,149 +142,151 @@ Tools/environment_install/install-prereqs-ubuntu.sh -y
 . ~/.profile
 ./waf configure --board sitl
 ./waf copter
-```
-### Build ardupilot_gazebo Plugin
-```commandline
+
+# ardupilot_gazebo plugin
 cd ~
 git clone https://github.com/ArduPilot/ardupilot_gazebo.git
 cd ardupilot_gazebo
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
 make -j$(nproc)
-```
-### Install ROS 2
-```commandline
-cd ~
-sudo apt update && sudo apt install locales
-sudo locale-gen en_US en_US.UTF-8
-sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-export LANG=en_US.UTF-8
-sudo apt install software-properties-common
-sudo add-apt-repository universe
-sudo apt update && sudo apt install curl -y
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
-sudo apt update && sudo apt upgrade -y
-sudo apt install ros-humble-desktop
-sudo apt install ros-dev-tools
-source /opt/ros/humble/setup.bash && echo "source /opt/ros/humble/setup.bash" >> .bashrc
-pip install --user -U empy pyros-genmsg setuptools
-```
-### Setup Micro XRCE-DDS Agent & Client
-```commandline
-cd ~
-git clone https://github.com/eProsima/Micro-XRCE-DDS-Agent.git
-cd Micro-XRCE-DDS-Agent
-mkdir build
-cd build
-cmake ..
-make
-sudo make install
-sudo ldconfig /usr/local/lib/
-```
-### Build ROS 2 Workspace
-```commandline
-mkdir -p ~/ws_sensor_combined/src/
-cd ~/ws_sensor_combined/src/
-git clone https://github.com/PX4/px4_msgs.git
-git clone https://github.com/PX4/px4_ros_com.git
-cd ..
-source /opt/ros/humble/setup.bash
-colcon build
 
-mkdir -p ~/ws_offboard_control/src/
-cd ~/ws_offboard_control/src/
-git clone https://github.com/PX4/px4_msgs.git
-git clone https://github.com/PX4/px4_ros_com.git
-cd ..
-source /opt/ros/humble/setup.bash
-colcon build
-```
-### Install MAVSDK
-```commandline
-pip install mavsdk
-pip install aioconsole
-pip install pygame
-sudo apt install ros-humble-ros-gzgarden
-```
-### Install Python Packages
-```commandline
+# ROS 2 Humble + Gazebo Garden bridge
+sudo apt install ros-humble-desktop ros-dev-tools ros-humble-ros-gzgarden
+
+# Python packages
 pip install mavsdk pymavlink aioconsole opencv-python ultralytics numpy
-```
-### Additional Configs
-- Put below lines in your bashrc:
-```commandline
-source /opt/ros/humble/setup.bash
-export GZ_SIM_RESOURCE_PATH=~/.gz/models:~/ardupilot_gazebo/models:~/ardupilot_gazebo/worlds
-export GZ_SIM_SYSTEM_PLUGIN_PATH=~/ardupilot_gazebo/build
-export PATH=$PATH:~/ardupilot/Tools/autotest
-```
-- Copy the content of models from main repo to ~/.gz/models
-- Copy default.sdf from worlds folder in the main repo to ~/PX4-Autopilot/Tools/simulation/gz/worlds/
-- Change the angle of Drone's camera for better visual:
-```commandline
-# Go to ~/PX4-Autopilot/Tools/simulation/gz/models/x500_depth/model.sdf then change <pose> tag in line 9 from:
-<pose>.12 .03 .242 0 0 0</pose>
-to:
-<pose>.15 .029 .21 0 0.7854 0</pose>
+
+# Bashrc
+echo 'source /opt/ros/humble/setup.bash' >> ~/.bashrc
+echo 'export GZ_SIM_RESOURCE_PATH=~/.gz/models:~/ardupilot_gazebo/models:~/ardupilot_gazebo/worlds' >> ~/.bashrc
+echo 'export GZ_SIM_SYSTEM_PLUGIN_PATH=~/ardupilot_gazebo/build' >> ~/.bashrc
+echo 'export PATH=$PATH:~/ardupilot/Tools/autotest' >> ~/.bashrc
+
+# Copy models
+cp -r ~/PX4-ROS2-Gazebo-YOLOv8/models/* ~/.gz/models/
+
+# Configure gimbal camera
+python ~/PX4-ROS2-Gazebo-YOLOv8/setup_gimbal_ardupilot.py
 ```
 
-## Run
-### Fly using Keyboard
-You need several terminals.
-```commandline
-Terminal #1:
-export GZ_SIM_SYSTEM_PLUGIN_PATH=~/ardupilot_gazebo/build
-export GZ_SIM_RESOURCE_PATH=~/.gz/models:~/ardupilot_gazebo/models:~/ardupilot_gazebo/worlds
+#### Run (ArduPilot)
+```bash
+# Terminal 1: Gazebo
 gz sim -r ~/ardupilot_gazebo/worlds/ardupilot_default.sdf
 
-Terminal #2:
+# Terminal 2: ArduCopter SITL
 cd ~/ardupilot
 Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console \
   --add-param-file ~/PX4-ROS2-Gazebo-YOLOv8/ardupilot_sitl.parm \
   --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14560 \
   -l 47.397971,8.546164,0,0
 
-Terminal #3:
-ros2 run ros_gz_image image_bridge /camera
+# Terminal 3: Camera bridge
+ros2 run ros_gz_bridge parameter_bridge \
+  /drone/camera@sensor_msgs/msg/Image[gz.msgs.Image \
+  --ros-args -r /drone/camera:=/camera
 
-Terminal #4:
-source ~/ardupilot-venv/bin/activate
-cd ~/PX4-ROS2-Gazebo-YOLOv8
-python uav_camera_det.py
+# Terminal 4: YOLOv8 detection
+cd ~/PX4-ROS2-Gazebo-YOLOv8 && python uav_camera_det.py
 
-Terminal #5:
-source ~/px4-venv/bin/activate
-cd ~/PX4-ROS2-Gazebo-YOLOv8
-python keyboard-mavsdk-test.py
+# Terminal 5: Moving car
+cd ~/PX4-ROS2-Gazebo-YOLOv8 && python move_car.py
+
+# Terminal 6: Keyboard controller
+cd ~/PX4-ROS2-Gazebo-YOLOv8 && python keyboard-mavsdk-test.py
 ```
-When you run the last command a blank window will open for reading inputs from keyboard. focus on that window by clicking on it, then hit "r" on keyboard to arm the drone, and use WASD and Up-Down-Left-Right on the keyboard for flying, and use "l" for landing.
 
-### Fly using ROS 2
-You need several terminals.
-```commandline
-Terminal #1:
-cd ~/Micro-XRCE-DDS-Agent
-MicroXRCEAgent udp4 -p 8888
+### PX4
 
-Terminal #2:
+```bash
+# Virtual environment
+python -m venv ~/px4-venv
+source ~/px4-venv/bin/activate
+
+# Clone this repo
+git clone https://github.com/farshidrayhancv/PX4-ROS2-Gazebo-YOLOv8.git
+
+# PX4 Autopilot
+cd ~
+git clone https://github.com/PX4/PX4-Autopilot.git --recursive
+bash ./PX4-Autopilot/Tools/setup/ubuntu.sh
+cd PX4-Autopilot && make px4_sitl
+
+# Micro XRCE-DDS Agent
+cd ~
+git clone https://github.com/eProsima/Micro-XRCE-DDS-Agent.git
+cd Micro-XRCE-DDS-Agent && mkdir build && cd build
+cmake .. && make && sudo make install && sudo ldconfig /usr/local/lib/
+
+# ROS 2 Humble + Gazebo Garden bridge
+sudo apt install ros-humble-desktop ros-dev-tools ros-humble-ros-gzgarden
+
+# ROS 2 workspaces
+mkdir -p ~/ws_sensor_combined/src && cd ~/ws_sensor_combined/src
+git clone https://github.com/PX4/px4_msgs.git
+git clone https://github.com/PX4/px4_ros_com.git
+cd .. && source /opt/ros/humble/setup.bash && colcon build
+
+# Python packages
+pip install mavsdk aioconsole opencv-python ultralytics numpy
+
+# Bashrc
+echo 'source /opt/ros/humble/setup.bash' >> ~/.bashrc
+echo 'export GZ_SIM_RESOURCE_PATH=~/.gz/models' >> ~/.bashrc
+
+# Copy models and world
+cp -r ~/PX4-ROS2-Gazebo-YOLOv8/models/* ~/.gz/models/
+cp ~/PX4-ROS2-Gazebo-YOLOv8/worlds/default_docker.sdf ~/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf
+
+# Configure gimbal camera
+python ~/PX4-ROS2-Gazebo-YOLOv8/setup_gimbal.py
+```
+
+#### Run (PX4)
+```bash
+# Terminal 1: DDS bridge
+cd ~/Micro-XRCE-DDS-Agent && MicroXRCEAgent udp4 -p 8888
+
+# Terminal 2: PX4 SITL
 cd ~/PX4-Autopilot
-PX4_SYS_AUTOSTART=4002 PX4_GZ_MODEL_POSE="283.08,-136.22,3.86,0.00,0,-0.7" PX4_GZ_MODEL=x500_depth ./build/px4_sitl_default/bin/px4
+PX4_SYS_AUTOSTART=4002 PX4_GZ_MODEL_POSE="268.08,-128.22,3.86,0.00,0,-0.7" \
+  PX4_GZ_MODEL=x500_depth ./build/px4_sitl_default/bin/px4
 
-Terminal #3:
-ros2 run ros_gz_image image_bridge /camera
+# Terminal 3: Camera bridge
+ros2 run ros_gz_bridge parameter_bridge \
+  /world/default/model/x500_depth_0/link/camera_link/sensor/IMX214/image@sensor_msgs/msg/Image[gz.msgs.Image \
+  --ros-args -r /world/default/model/x500_depth_0/link/camera_link/sensor/IMX214/image:=/camera
 
-Terminal #4:
-source ~/px4-venv/bin/activate
-cd ~/PX4-ROS2-Gazebo-YOLOv8
-python uav_camera_det.py
+# Terminal 4: YOLOv8 detection
+cd ~/PX4-ROS2-Gazebo-YOLOv8 && python uav_camera_det.py
 
-Terminal #5:
-cd ~/ws_offboard_control
-source /opt/ros/humble/setup.bash
-source install/local_setup.bash
-ros2 run px4_ros_com offboard_control
+# Terminal 5: Moving car
+cd ~/PX4-ROS2-Gazebo-YOLOv8 && python move_car.py
+
+# Terminal 6: Keyboard controller
+cd ~/PX4-ROS2-Gazebo-YOLOv8 && python keyboard-mavsdk-test.py
 ```
+
+## Project Structure
+
+| File | Description |
+|------|-------------|
+| `Dockerfile` | ArduPilot Docker build |
+| `Dockerfile.px4` | PX4 Docker build |
+| `run_ardupilot.sh` | Build and run ArduPilot Docker |
+| `run_px4.sh` | Build and run PX4 Docker |
+| `keyboard-mavsdk-test.py` | Keyboard flight control, gimbal, and mode switching |
+| `KeyPressModule.py` | Terminal keyboard input handler |
+| `uav_camera_det.py` | ROS 2 YOLOv8 detection node |
+| `move_car.py` | Drives hatchback in circles for tracking |
+| `setup_gimbal_ardupilot.py` | Configures gimbal camera for ArduPilot iris model |
+| `setup_gimbal.py` | Configures gimbal camera for PX4 x500_depth model |
+| `ardupilot_ros2_gazebo.yml` | Tmuxinator config (ArduPilot) |
+| `px4_ros2_gazebo.yml` | Tmuxinator config (PX4) |
+| `ardupilot_sitl.parm` | ArduCopter SITL parameters |
+| `worlds/ardupilot_default.sdf` | Gazebo world (ArduPilot) |
+| `worlds/default_docker.sdf` | Gazebo world (PX4) |
 
 ## Acknowledgement
 - https://github.com/ArduPilot/ardupilot
