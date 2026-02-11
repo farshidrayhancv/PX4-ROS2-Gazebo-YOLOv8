@@ -4,7 +4,7 @@ Aerial Object Detection using a Drone with PX4 Autopilot / ArduPilot and ROS 2. 
 ## Supported Hardware
 - **Pixhawk 6X/6C (H7 series)** — STM32H753 processor @ 480 MHz, running ArduCopter
 - Any ArduPilot-compatible flight controller
-- PX4-based flight controllers (legacy support via `Dockerfile.px4`)
+- PX4-based flight controllers (via `Dockerfile.px4`)
 
 ## Features
 - Keyboard-controlled drone flight (WASD + arrow keys) via MAVSDK
@@ -23,7 +23,7 @@ https://github.com/monemati/PX4-ROS2-Gazebo-YOLOv8/assets/58460889/fab19f49-0be6
 
 Two Dockerfiles are provided:
 - `Dockerfile` — **ArduPilot/ArduCopter** (default, recommended for Pixhawk hardware)
-- `Dockerfile.px4` — PX4 Autopilot (legacy)
+- `Dockerfile.px4` — PX4 Autopilot
 
 ### Prerequisites
 Allow Docker to access the X11 display:
@@ -121,7 +121,7 @@ keyboard-mavsdk-test.py                                     |
                                                    uav_camera_det.py (YOLOv8)
 ```
 
-### PX4 Stack (Legacy)
+### PX4 Stack
 ```
 PX4 SITL  <-->  Gazebo Garden
     |               |
