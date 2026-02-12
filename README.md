@@ -1,5 +1,9 @@
 # PX4-ROS2-Gazebo-YOLOv8
 
+<p align="center">
+  <img src="assets/ros2_sim.png" alt="Simulation overview — Gazebo 3D view, lane detection camera, and terminal output" width="100%"/>
+</p>
+
 Aerial Object Detection using a Drone with PX4 Autopilot or ArduPilot, ROS 2, Gazebo Garden, and YOLOv8. Includes a vision-based autonomous lane-keeping car on Sonoma Raceway.
 
 Two autopilot stacks are supported — choose based on your hardware:
@@ -7,7 +11,8 @@ Two autopilot stacks are supported — choose based on your hardware:
 - **PX4 Autopilot** — for PX4-based flight controllers
 
 ## Demo
-https://github.com/monemati/PX4-ROS2-Gazebo-YOLOv8/assets/58460889/fab19f49-0be6-43ea-a4e4-8e9bc8d59af9
+
+https://github.com/user-attachments/assets/878b75fd-134b-4159-94c9-36afef6882e8
 
 ## Features
 - Keyboard-controlled drone flight (WASD + arrow keys) via MAVSDK
