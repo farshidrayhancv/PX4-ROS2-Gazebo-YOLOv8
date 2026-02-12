@@ -12,9 +12,7 @@ Two autopilot stacks are supported — choose based on your hardware:
 
 ## Demo
 
-<p align="center">
-  <video src="assets/ros2_sim_5x.mp4" width="100%" controls></video>
-</p>
+https://github.com/user-attachments/assets/878b75fd-134b-4159-94c9-36afef6882e8
 
 ## Features
 - Keyboard-controlled drone flight (WASD + arrow keys) via MAVSDK
