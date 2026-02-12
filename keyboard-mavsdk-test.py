@@ -11,14 +11,28 @@ drone = System()
 roll, pitch, throttle, yaw = 0, 0, 0, 0
 is_connected = False
 
-# Gimbal state
-gimbal_pitch = 0.7854  # initial 45 deg down
+# Gimbal state (x500_gimbal model: negative pitch = camera down)
+gimbal_pitch = -0.7854  # initial 45 deg down
 gimbal_yaw = 0.0
-GIMBAL_STEP = 0.03  # rad per tick (~1.7 deg)
-GIMBAL_PITCH_MIN = -1.57
-GIMBAL_PITCH_MAX = 0.5
-GIMBAL_YAW_MIN = -1.57
-GIMBAL_YAW_MAX = 1.57
+gimbal_roll = 0.0
+GIMBAL_SPEED = 0.6  # rad/sec — smooth continuous motion
+GIMBAL_PITCH_MIN = -2.356  # -135 deg (max downward)
+GIMBAL_PITCH_MAX = 0.785   # +45 deg (max upward)
+GIMBAL_YAW_MIN = -3.14
+GIMBAL_YAW_MAX = 3.14
+GIMBAL_ROLL_MIN = -0.785
+GIMBAL_ROLL_MAX = 0.785
+
+# Gimbal velocity (set by keyboard handler, applied by gimbal_publisher)
+gimbal_vel_pitch = 0.0
+gimbal_vel_yaw = 0.0
+gimbal_vel_roll = 0.0
+
+# Gimbal topics renamed to 'manual/*' to prevent PX4 gz_bridge override
+# (PX4 publishes to 'command/*' which nothing listens to)
+GIMBAL_TOPIC_PITCH = '/model/x500_gimbal_0/manual/gimbal_pitch'
+GIMBAL_TOPIC_YAW = '/model/x500_gimbal_0/manual/gimbal_yaw'
+GIMBAL_TOPIC_ROLL = '/model/x500_gimbal_0/manual/gimbal_roll'
 
 # ArduCopter flight mode mapping (key -> mode name)
 ARDUPILOT_MODES = {
@@ -76,8 +90,35 @@ def set_gimbal(topic, value):
     )
 
 
+async def gimbal_publisher():
+    """Continuously apply gimbal velocity and publish positions for smooth motion.
+
+    Runs at 20 Hz.  Key presses set gimbal_vel_* (velocity); this task
+    integrates velocity → position and publishes the latest value whenever
+    the previous subprocess has finished.  Result: smooth, continuous gimbal
+    motion instead of discrete jumps.
+    """
+    global gimbal_pitch, gimbal_yaw, gimbal_roll
+    dt = 0.05  # 20 Hz
+    while True:
+        if gimbal_vel_pitch != 0:
+            gimbal_pitch = max(GIMBAL_PITCH_MIN, min(GIMBAL_PITCH_MAX,
+                               gimbal_pitch + gimbal_vel_pitch * dt))
+            set_gimbal(GIMBAL_TOPIC_PITCH, gimbal_pitch)
+        if gimbal_vel_yaw != 0:
+            gimbal_yaw = max(GIMBAL_YAW_MIN, min(GIMBAL_YAW_MAX,
+                             gimbal_yaw + gimbal_vel_yaw * dt))
+            set_gimbal(GIMBAL_TOPIC_YAW, gimbal_yaw)
+        if gimbal_vel_roll != 0:
+            gimbal_roll = max(GIMBAL_ROLL_MIN, min(GIMBAL_ROLL_MAX,
+                              gimbal_roll + gimbal_vel_roll * dt))
+            set_gimbal(GIMBAL_TOPIC_ROLL, gimbal_roll)
+        await asyncio.sleep(dt)
+
+
 async def getKeyboardInput(my_drone):
-    global roll, pitch, throttle, yaw, gimbal_pitch, gimbal_yaw
+    global roll, pitch, throttle, yaw
+    global gimbal_vel_pitch, gimbal_vel_yaw, gimbal_vel_roll
     while True:
         roll, pitch, throttle, yaw = 0, 0, 0.5, 0
         value = 0.5
@@ -114,19 +155,14 @@ async def getKeyboardInput(my_drone):
             except Exception as e:
                 log(f"-- Land failed: {e}")
 
-        # Gimbal controls
-        if kp.getKey("j"):
-            gimbal_pitch = max(GIMBAL_PITCH_MIN, gimbal_pitch - GIMBAL_STEP)
-            set_gimbal('/gimbal/cmd_pitch', gimbal_pitch)
-        elif kp.getKey("k"):
-            gimbal_pitch = min(GIMBAL_PITCH_MAX, gimbal_pitch + GIMBAL_STEP)
-            set_gimbal('/gimbal/cmd_pitch', gimbal_pitch)
-        if kp.getKey("n"):
-            gimbal_yaw = max(GIMBAL_YAW_MIN, gimbal_yaw - GIMBAL_STEP)
-            set_gimbal('/gimbal/cmd_yaw', gimbal_yaw)
-        elif kp.getKey("m"):
-            gimbal_yaw = min(GIMBAL_YAW_MAX, gimbal_yaw + GIMBAL_STEP)
-            set_gimbal('/gimbal/cmd_yaw', gimbal_yaw)
+        # Gimbal controls — set velocity, gimbal_publisher applies it smoothly
+        gimbal_vel_pitch = (-GIMBAL_SPEED if kp.getKey("j") else
+                            GIMBAL_SPEED if kp.getKey("k") else 0.0)
+        # Yaw sign inverted due to gimbal 180° mount offset (pose yaw=3.14)
+        gimbal_vel_yaw = (GIMBAL_SPEED if kp.getKey("n") else
+                          -GIMBAL_SPEED if kp.getKey("m") else 0.0)
+        gimbal_vel_roll = (-GIMBAL_SPEED if kp.getKey("u") else
+                           GIMBAL_SPEED if kp.getKey("o") else 0.0)
 
         # Flight mode switching (ArduCopter)
         for key, mode in ARDUPILOT_MODES.items():
@@ -170,8 +206,12 @@ async def run_drone():
         await drone.manual_control.set_manual_control_input(0, 0, 0, 0)
         await asyncio.sleep(0.05)
 
+    # Set initial gimbal pitch (45 deg down)
+    set_gimbal(GIMBAL_TOPIC_PITCH, gimbal_pitch)
+
     log("-- Ready! Press 'r' to arm the drone.")
     asyncio.ensure_future(manual_control_drone(drone))
+    asyncio.ensure_future(gimbal_publisher())
 
 
 async def run():

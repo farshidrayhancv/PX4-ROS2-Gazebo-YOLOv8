@@ -80,7 +80,7 @@ COPY models/. /root/.gz/models/
 COPY models_docker/. /root/.gz/fuel/fuel.ignitionrobotics.org/openrobotics/models/
 COPY worlds/default_docker.sdf /root/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf
 
-# Setup gimbal joints for camera control
+# Add thermal camera + rename gimbal topics to avoid PX4 gz_bridge override
 RUN python3 /root/PX4-ROS2-Gazebo-YOLOv8/setup_gimbal.py
 
 # Additional Configs

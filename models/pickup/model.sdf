@@ -20,5 +20,9 @@
         </geometry>
       </visual>
     </link>
+    <plugin filename="gz-sim-thermal-system"
+            name="gz::sim::systems::Thermal">
+      <temperature>303</temperature>
+    </plugin>
   </model>
 </sdf>
