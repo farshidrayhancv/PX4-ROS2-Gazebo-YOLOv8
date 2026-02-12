@@ -4,7 +4,9 @@
 1. Renames JointPositionController sub_topics from 'command/gimbal_*' to
    'manual/gimbal_*' so PX4's gz_bridge gimbal handler (which publishes to
    'command/gimbal_*') doesn't override keyboard commands.
-2. Adds a thermal camera sensor co-located with the RGB camera.
+2. Tunes PID gains for smoother gimbal tracking.
+3. Adds a thermal camera sensor co-located with the RGB camera.
+4. Adds a depth camera sensor co-located with the RGB camera.
 
 Run during Docker build after PX4 is built.
 """
@@ -107,6 +109,44 @@ def add_thermal_sensor(camera_link):
     return True
 
 
+def add_depth_sensor(camera_link):
+    """Add a depth camera sensor to the gimbal's camera_link."""
+    for sensor in camera_link.findall("sensor"):
+        if sensor.get("name") == "depth_camera":
+            print("  Depth camera sensor already exists, skipping.")
+            return False
+
+    sensor = ET.SubElement(camera_link, "sensor")
+    sensor.set("name", "depth_camera")
+    sensor.set("type", "depth_camera")
+
+    pose = ET.SubElement(sensor, "pose")
+    pose.text = "-0.0412 0 -0.162 0 0 3.14"
+
+    gz_frame = ET.SubElement(sensor, "gz_frame_id")
+    gz_frame.text = "camera_link"
+
+    camera = ET.SubElement(sensor, "camera")
+
+    hfov = ET.SubElement(camera, "horizontal_fov")
+    hfov.text = "1.274"
+
+    image = ET.SubElement(camera, "image")
+    ET.SubElement(image, "width").text = "640"
+    ET.SubElement(image, "height").text = "480"
+    ET.SubElement(image, "format").text = "R_FLOAT32"
+
+    clip = ET.SubElement(camera, "clip")
+    ET.SubElement(clip, "near").text = "0.2"
+    ET.SubElement(clip, "far").text = "100"
+
+    ET.SubElement(sensor, "always_on").text = "1"
+    ET.SubElement(sensor, "update_rate").text = "10"
+    ET.SubElement(sensor, "visualize").text = "true"
+
+    return True
+
+
 def main():
     tree = ET.parse(MODEL_PATH)
     root = tree.getroot()
@@ -134,6 +174,10 @@ def main():
     else:
         if add_thermal_sensor(camera_link):
             print(f"  Thermal camera added (320x240, L16, 10 Hz)")
+
+        # 4. Add depth camera
+        if add_depth_sensor(camera_link):
+            print(f"  Depth camera added (640x480, R_FLOAT32, 10 Hz)")
 
     ET.indent(tree, space="  ")
     tree.write(MODEL_PATH, xml_declaration=True, encoding="UTF-8")

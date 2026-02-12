@@ -121,7 +121,7 @@ async def getKeyboardInput(my_drone):
     global gimbal_vel_pitch, gimbal_vel_yaw, gimbal_vel_roll
     while True:
         roll, pitch, throttle, yaw = 0, 0, 0.5, 0
-        value = 0.5
+        value = 0.75
 
         # Flight controls
         if kp.getKey("LEFT"):

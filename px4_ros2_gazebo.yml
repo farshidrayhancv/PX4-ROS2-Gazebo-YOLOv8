@@ -15,3 +15,5 @@ windows:
         - sleep 6 && cd /root/PX4-ROS2-Gazebo-YOLOv8 && python3 keyboard-mavsdk-test.py
         - sleep 10 && ros2 run ros_gz_bridge parameter_bridge /world/default/model/x500_gimbal_0/link/camera_link/sensor/thermal_camera/image@sensor_msgs/msg/Image[gz.msgs.Image --ros-args -r /world/default/model/x500_gimbal_0/link/camera_link/sensor/thermal_camera/image:=/thermal_camera
         - sleep 12 && cd /root/PX4-ROS2-Gazebo-YOLOv8 && python3 thermal_camera_viewer.py
+        - sleep 10 && ros2 run ros_gz_bridge parameter_bridge /world/default/model/x500_gimbal_0/link/camera_link/sensor/depth_camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image --ros-args -r /world/default/model/x500_gimbal_0/link/camera_link/sensor/depth_camera/depth_image:=/depth_camera
+        - sleep 12 && cd /root/PX4-ROS2-Gazebo-YOLOv8 && python3 depth_camera_viewer.py
