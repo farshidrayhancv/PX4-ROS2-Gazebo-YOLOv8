@@ -9,7 +9,7 @@ windows:
         - cd /root/Micro-XRCE-DDS-Agent && MicroXRCEAgent udp4 -p 8888
         - sleep 3 && cd /root/PX4-Autopilot && PX4_SYS_AUTOSTART=4019 PX4_GZ_MODEL_POSE="268.08,-128.22,3.86,0.00,0,-0.7" PX4_GZ_MODEL=x500_gimbal ./build/px4_sitl_default/bin/px4
         - sleep 10 && ros2 run ros_gz_bridge parameter_bridge /world/default/model/x500_gimbal_0/link/camera_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image --ros-args -r /world/default/model/x500_gimbal_0/link/camera_link/sensor/camera/image:=/camera
-        - sleep 6 && cd /root/PX4-ROS2-Gazebo-YOLOv8 && python3 uav_camera_det.py
+        - sleep 30 && cd /root/PX4-ROS2-Gazebo-YOLOv8 && python3 gimbal_tracker.py
         - sleep 10 && ros2 run ros_gz_bridge parameter_bridge /car/camera@sensor_msgs/msg/Image[gz.msgs.Image '/model/hatchback_blue_1/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist' --ros-args -r /car/camera:=/car_camera
         - sleep 12 && cd /root/PX4-ROS2-Gazebo-YOLOv8 && python3 lane_keeping.py
         - sleep 6 && cd /root/PX4-ROS2-Gazebo-YOLOv8 && python3 keyboard-mavsdk-test.py
