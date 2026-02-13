@@ -1,7 +1,8 @@
 import asyncio
-import subprocess
+import math
 import sys
 from mavsdk import System
+from mavsdk.gimbal import GimbalMode
 from pymavlink import mavutil
 import KeyPressModule as kp
 
@@ -27,12 +28,6 @@ GIMBAL_ROLL_MAX = 0.785
 gimbal_vel_pitch = 0.0
 gimbal_vel_yaw = 0.0
 gimbal_vel_roll = 0.0
-
-# Gimbal topics renamed to 'manual/*' to prevent PX4 gz_bridge override
-# (PX4 publishes to 'command/*' which nothing listens to)
-GIMBAL_TOPIC_PITCH = '/model/x500_gimbal_0/manual/gimbal_pitch'
-GIMBAL_TOPIC_YAW = '/model/x500_gimbal_0/manual/gimbal_yaw'
-GIMBAL_TOPIC_ROLL = '/model/x500_gimbal_0/manual/gimbal_roll'
 
 # ArduCopter flight mode mapping (key -> mode name)
 ARDUPILOT_MODES = {
@@ -76,43 +71,43 @@ def set_flight_mode(mode_name):
         log(f"-- Mode change failed: {e}")
 
 
-_gimbal_procs = {}
-
-def set_gimbal(topic, value):
-    # Don't spawn if previous command for this topic is still running
-    prev = _gimbal_procs.get(topic)
-    if prev is not None and prev.poll() is None:
-        return
-    _gimbal_procs[topic] = subprocess.Popen(
-        ['gz', 'topic', '-t', topic, '-m', 'gz.msgs.Double',
-         '-p', f'data: {value:.4f}'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-
 async def gimbal_publisher():
-    """Continuously apply gimbal velocity and publish positions for smooth motion.
+    """Continuously apply gimbal velocity and publish via MAVSDK (through PX4).
 
-    Runs at 20 Hz.  Key presses set gimbal_vel_* (velocity); this task
-    integrates velocity → position and publishes the latest value whenever
-    the previous subprocess has finished.  Result: smooth, continuous gimbal
-    motion instead of discrete jumps.
+    Runs at 20 Hz. Key presses set gimbal_vel_* (velocity); this task
+    integrates velocity -> position and sends the command via MAVSDK's gimbal
+    API, which routes through PX4 for attitude-stabilized gimbal control.
     """
     global gimbal_pitch, gimbal_yaw, gimbal_roll
     dt = 0.05  # 20 Hz
+
+    try:
+        await drone.gimbal.set_mode(GimbalMode.YAW_FOLLOW)
+        log("-- Gimbal mode: YAW_FOLLOW")
+    except Exception as e:
+        log(f"-- Gimbal mode set failed (non-fatal): {e}")
+
     while True:
+        changed = False
         if gimbal_vel_pitch != 0:
             gimbal_pitch = max(GIMBAL_PITCH_MIN, min(GIMBAL_PITCH_MAX,
                                gimbal_pitch + gimbal_vel_pitch * dt))
-            set_gimbal(GIMBAL_TOPIC_PITCH, gimbal_pitch)
+            changed = True
         if gimbal_vel_yaw != 0:
             gimbal_yaw = max(GIMBAL_YAW_MIN, min(GIMBAL_YAW_MAX,
                              gimbal_yaw + gimbal_vel_yaw * dt))
-            set_gimbal(GIMBAL_TOPIC_YAW, gimbal_yaw)
+            changed = True
         if gimbal_vel_roll != 0:
             gimbal_roll = max(GIMBAL_ROLL_MIN, min(GIMBAL_ROLL_MAX,
                               gimbal_roll + gimbal_vel_roll * dt))
-            set_gimbal(GIMBAL_TOPIC_ROLL, gimbal_roll)
+            changed = True
+        if changed:
+            try:
+                await drone.gimbal.set_pitch_and_yaw(
+                    math.degrees(gimbal_pitch),
+                    math.degrees(gimbal_yaw))
+            except Exception:
+                pass  # Don't spam errors during rapid key input
         await asyncio.sleep(dt)
 
 
@@ -206,8 +201,12 @@ async def run_drone():
         await drone.manual_control.set_manual_control_input(0, 0, 0, 0)
         await asyncio.sleep(0.05)
 
-    # Set initial gimbal pitch (45 deg down)
-    set_gimbal(GIMBAL_TOPIC_PITCH, gimbal_pitch)
+    # Set initial gimbal pitch (45 deg down) via MAVSDK (through PX4)
+    try:
+        await drone.gimbal.set_pitch_and_yaw(
+            math.degrees(gimbal_pitch), math.degrees(gimbal_yaw))
+    except Exception as e:
+        log(f"-- Initial gimbal set failed (non-fatal): {e}")
 
     log("-- Ready! Press 'r' to arm the drone.")
     asyncio.ensure_future(manual_control_drone(drone))

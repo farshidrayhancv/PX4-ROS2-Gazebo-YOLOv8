@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Modify the x500_gimbal's gimbal model for keyboard-controlled operation.
+"""Modify the x500_gimbal's gimbal model for the simulation.
 
-1. Renames JointPositionController sub_topics from 'command/gimbal_*' to
-   'manual/gimbal_*' so PX4's gz_bridge gimbal handler (which publishes to
-   'command/gimbal_*') doesn't override keyboard commands.
-2. Tunes PID gains for smoother gimbal tracking.
-3. Adds a thermal camera sensor co-located with the RGB camera.
-4. Adds a depth camera sensor co-located with the RGB camera.
+1. Tunes PID gains for smoother gimbal tracking.
+2. Adds a thermal camera sensor co-located with the RGB camera.
+3. Adds a depth camera sensor co-located with the RGB camera.
+4. Adds JointStatePublisher for diagnostics.
+
+Gimbal commands flow through PX4's MAVLink gimbal protocol v2
+(GZGimbal bridge publishes to 'command/gimbal_*' topics).
 
 Run during Docker build after PX4 is built.
 """
@@ -14,31 +15,6 @@ Run during Docker build after PX4 is built.
 import xml.etree.ElementTree as ET
 
 MODEL_PATH = "/root/PX4-Autopilot/Tools/simulation/gz/models/gimbal/model.sdf"
-
-# Rename gimbal topics: PX4 publishes to 'command/*' (ignored),
-# keyboard publishes to 'manual/*' (actually controls the joints)
-TOPIC_RENAMES = {
-    "command/gimbal_pitch": "manual/gimbal_pitch",
-    "command/gimbal_roll": "manual/gimbal_roll",
-    "command/gimbal_yaw": "manual/gimbal_yaw",
-}
-
-
-def rename_gimbal_topics(model):
-    """Rename JointPositionController sub_topics to avoid PX4 override."""
-    count = 0
-    for plugin in model.findall("plugin"):
-        name = plugin.get("name", "")
-        if "JointPositionController" not in name:
-            continue
-        sub_topic = plugin.find("sub_topic")
-        if sub_topic is not None and sub_topic.text in TOPIC_RENAMES:
-            old = sub_topic.text
-            sub_topic.text = TOPIC_RENAMES[old]
-            count += 1
-            print(f"  Renamed: {old} -> {sub_topic.text}")
-    return count
-
 
 # PID tuning: increase responsiveness for smoother tracking of continuous
 # position commands.  Stock values are very conservative (P≈0.3-0.8,
@@ -177,12 +153,9 @@ def main():
     root = tree.getroot()
     model = root.find("model")
 
-    # 1. Rename gimbal topics to prevent PX4 override
-    print(f"Renaming gimbal topics in {MODEL_PATH}:")
-    n = rename_gimbal_topics(model)
-    print(f"  {n} topics renamed")
+    print(f"Modifying gimbal model: {MODEL_PATH}")
 
-    # 2. Tune PID for smoother, more responsive gimbal tracking
+    # 1. Tune PID for smoother, more responsive gimbal tracking
     n = tune_pid_gains(model)
     print(f"  {n} JointPositionControllers tuned (P={PID_OVERRIDES['p_gain']}, "
           f"D={PID_OVERRIDES['d_gain']}, cmd_max={PID_OVERRIDES['cmd_max']})")

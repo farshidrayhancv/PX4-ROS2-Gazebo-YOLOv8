@@ -29,8 +29,8 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
-GIMBAL_TOPIC_PITCH = '/model/x500_gimbal_0/manual/gimbal_pitch'
-GIMBAL_TOPIC_YAW = '/model/x500_gimbal_0/manual/gimbal_yaw'
+GIMBAL_TOPIC_PITCH = '/model/x500_gimbal_0/command/gimbal_pitch'
+GIMBAL_TOPIC_YAW = '/model/x500_gimbal_0/command/gimbal_yaw'
 GZ_JOINT_STATE_TOPIC = '/world/default/model/x500_gimbal_0/joint_state'
 
 STEP_SIZE = 0.3  # radians (~17 degrees)

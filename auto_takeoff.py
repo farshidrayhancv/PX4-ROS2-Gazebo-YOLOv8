@@ -19,9 +19,9 @@ from mavsdk.offboard import OffboardError, PositionNedYaw
 
 # Target position in NED (relative to home/spawn)
 # Derived from Gazebo pose: drone at (370.97, -57.77, 19.54), spawn at (268.08, -128.22, 3.86)
-TARGET_NORTH = 70.5    # meters  (Gazebo ΔY)
-TARGET_EAST = 102.9    # meters  (Gazebo ΔX)
-TARGET_ALT = 15.7      # meters AGL  (Gazebo ΔZ = 19.54 - 3.86)
+TARGET_NORTH = -49.4   # meters  (Gazebo ΔY)
+TARGET_EAST = 184.7    # meters  (Gazebo ΔX)
+TARGET_ALT = 15.6      # meters AGL
 TARGET_DOWN = -TARGET_ALT
 
 # Heading: 170° Gazebo ENU → NED = 90° - 170° = -80° → 280°

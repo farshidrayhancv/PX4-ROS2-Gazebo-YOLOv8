@@ -5,19 +5,19 @@ Subscribes to /camera (ROS 2 Image), runs YOLOv8 to detect cars, and
 controls the gimbal (pitch + yaw) to keep the tracked car centered in
 the camera frame.
 
-Architecture (matches industry-standard inner-outer loop):
-  - Inner loop: Gazebo JointPositionController (PID, closed-loop on
-    joint angle, ~250 Hz physics rate, cmd_max=1.0 rad/s)
-  - Outer loop: This node — vision-based P controller that reads
-    ACTUAL gimbal angles from joint state, computes absolute target
-    angles, and publishes position commands.
-
-Key difference from naive approach: we read actual gimbal joint angles
-each frame instead of accumulating incremental commands blindly.
-This prevents software/physical drift that causes "misfiring."
+Architecture:
+  - Gimbal commands go through PX4 via VehicleCommand (MAV_CMD 1000):
+      tracker → /fmu/in/vehicle_command → PX4 gimbal manager
+        → pitch stabilization (IMU) → GZGimbal → Gazebo joints
+  - PX4 stabilizes pitch in earth frame (PITCH_LOCK): when the drone
+    tilts, the gimbal compensates to maintain horizon-relative pitch.
+  - Yaw follows vehicle heading (no YAW_LOCK): yaw=0 means forward.
+  - Feedback comes from PX4 via /fmu/out/gimbal_device_attitude_status.
+  - WAITING state triggers when drone reaches the viewing position
+    (position-based, not time-based).
 
 State machine:
-  SEARCHING -> ACQUIRING -> TRACKING -> LOST -> SEARCHING
+  WAITING -> SEARCHING -> ACQUIRING -> TRACKING -> LOST -> SEARCHING
 
 Writes a per-frame CSV log to /tmp/gimbal_tracker.csv for diagnostics.
 """
@@ -25,39 +25,18 @@ Writes a per-frame CSV log to /tmp/gimbal_tracker.csv for diagnostics.
 import csv
 import math
 import os
-import threading
 import time
 from enum import Enum, auto
 
-# gz.msgs protobuf needs this workaround for protobuf version mismatch
-os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
-
 import cv2
-import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from gz.msgs10.double_pb2 import Double as GzDouble
-from gz.msgs10.model_pb2 import Model as GzModel
-from gz.transport13 import Node as GzNode
+from px4_msgs.msg import (GimbalDeviceAttitudeStatus, VehicleCommand,
+                          VehicleLocalPosition)
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from ultralytics import YOLO
-
-# ── Gimbal topics (must match setup_gimbal.py 'manual/*' naming) ──
-GIMBAL_TOPIC_PITCH = '/model/x500_gimbal_0/manual/gimbal_pitch'
-GIMBAL_TOPIC_YAW = '/model/x500_gimbal_0/manual/gimbal_yaw'
-
-# ── Gazebo joint state topic (published by JointStatePublisher plugin) ──
-GZ_JOINT_STATE_TOPIC = '/world/default/model/x500_gimbal_0/joint_state'
-
-# ── Gimbal joint names (from x500_gimbal model SDF) ────────────────
-# Verified against JointPositionController sub_topic mapping:
-#   manual/gimbal_yaw   → cgo3_vertical_arm_joint
-#   manual/gimbal_pitch → cgo3_camera_joint
-#   manual/gimbal_roll  → cgo3_horizontal_arm_joint
-JOINT_YAW = 'cgo3_vertical_arm_joint'
-JOINT_PITCH = 'cgo3_camera_joint'
-JOINT_ROLL = 'cgo3_horizontal_arm_joint'
 
 # ── Gimbal limits (from SDF joint definitions) ────────────────────
 GIMBAL_PITCH_MIN = -2.356   # -135 deg (cgo3_camera_joint lower limit)
@@ -66,125 +45,140 @@ GIMBAL_YAW_MIN = -3.14
 GIMBAL_YAW_MAX = 3.14
 
 # ── Search pose (default yaw, tilted down) ────────────────────────
-SEARCH_PITCH = -0.7854      # -45 deg (default look-down angle)
+SEARCH_PITCH = -0.9599      # -55 deg (default look-down angle)
 SEARCH_YAW = 0.0            # no yaw rotation
 
 # ── Camera parameters ────────────────────────────────────────────
 HFOV = 1.047                # horizontal FOV in rad (60 deg), from model SDF
 
 # ── P controller gain ─────────────────────────────────────────────
-# With closed-loop feedback (actual angle read each frame), a simple
-# P controller is stable and converges.  Kp=1.0 means "point directly
-# at the car."  Kp<1.0 dampens and converges over multiple frames.
-# No rate limiter needed — Gazebo's JointPositionController has
-# cmd_max=1.0 rad/s which physically limits joint velocity.
-Kp = 0.8                    # proportional gain (on angular error)
+Kp = 0.5                    # proportional gain (on angular error)
+MAX_STEP_RAD = 0.05         # max gimbal change per frame (~3 deg)
 DEADZONE_PX = 15            # pixel deadzone to prevent jitter
 
 # ── Detection settings ───────────────────────────────────────────
 YOLO_MODEL = os.path.join(os.path.dirname(__file__), 'assets', 'drone_car_yolov11n.pt')
 TARGET_CLASS = 0             # custom model: class 0 = car (single-class)
-CONF_THRESHOLD = 0.4
+CONF_THRESHOLD = 0.6
 
-# ── Startup: wait for drone to reach viewing position ───────────
-# The tracker starts at sleep 30, auto_takeoff at sleep 25.
-# auto_takeoff needs ~30s to reach the waypoint (arm + takeoff + fly).
-# So we wait ~30s after tracker start before enabling search.
-STARTUP_DELAY = 30.0         # seconds to wait before enabling search
+# ── Viewing position (from auto_takeoff.py, NED frame) ──────────
+VIEW_POS_NORTH = -49.4       # meters from home
+VIEW_POS_EAST = 184.7
+VIEW_POS_DOWN = -15.6        # negative = up
+VIEW_POS_TOLERANCE = 5.0     # meters
+VIEW_POS_DWELL = 10.0        # seconds drone must stay within tolerance
 
 # ── Tracking state parameters ────────────────────────────────────
 HOLD_TIME = 3.0              # seconds to hold position after losing track
-SEARCH_RETURN_SPEED = 0.3    # rad/sec for smooth return to search pose
 ACQUIRING_THRESHOLD = 30     # pixels from center to consider "acquired"
 ACQUIRING_FRAMES = 5         # consecutive centered frames to confirm lock
 MAX_TARGET_JUMP_PX = 200     # reject detections jumping too far from last
 
 # ── Log file and frame saving ────────────────────────────────────
 LOG_PATH = '/tmp/gimbal_tracker.csv'
-SAVE_FRAMES = True          # save raw frames for YOLO training
+SAVE_FRAMES = True
 FRAMES_DIR = '/tmp/gimbal_frames'
-SAVE_FRAME_START = 2700     # only save frames in this range
-SAVE_FRAME_END = 3400       # (max ~700 images)
+SAVE_FRAME_START = 2700
+SAVE_FRAME_END = 3400
 
 
 class State(Enum):
-    WAITING = auto()      # waiting for drone to reach viewing position
+    WAITING = auto()
     SEARCHING = auto()
     ACQUIRING = auto()
     TRACKING = auto()
     LOST = auto()
 
 
-# ── Gimbal publisher (native gz.transport — no subprocess overhead) ──
-_gz_node = GzNode()
-_gz_pubs = {}  # topic -> publisher
+# ── Quaternion helper (for feedback decoding) ────────────────────
 
+def quaternion_to_pitch_yaw(q):
+    """Extract pitch and yaw from [w, x, y, z] quaternion.
 
-def set_gimbal(topic, value):
-    """Publish a gimbal joint position via native gz.transport.
-
-    Uses a persistent publisher (no subprocess spawning), so every
-    command is delivered immediately and reliably.
+    Returns (pitch_rad, yaw_rad).
     """
-    pub = _gz_pubs.get(topic)
-    if pub is None:
-        pub = _gz_node.advertise(topic, GzDouble)
-        _gz_pubs[topic] = pub
-        time.sleep(0.2)  # brief pause for first advertisement to register
-    msg = GzDouble()
-    msg.data = value
-    return pub.publish(msg)
+    w, x, y, z = q
+    # Pitch (rotation about Y axis)
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.copysign(math.pi / 2, sinp)
+    else:
+        pitch = math.asin(sinp)
+    # Yaw (rotation about Z axis)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+    return pitch, yaw
+
+
+# ── QoS profile for PX4 topics ──────────────────────────────────
+PX4_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+)
 
 
 class GimbalTracker(Node):
     def __init__(self):
         super().__init__('gimbal_tracker')
 
-        # ROS 2 subscription (camera only)
+        # ── ROS 2 subscriptions ─────────────────────────────────
         self.create_subscription(Image, 'camera', self.on_image, 1)
         self.br = CvBridge()
 
-        # YOLOv8 (explicit CUDA to avoid first-frame cold start)
+        # Gimbal attitude feedback from PX4
+        self.create_subscription(
+            GimbalDeviceAttitudeStatus,
+            '/fmu/out/gimbal_device_attitude_status',
+            self._on_gimbal_attitude, PX4_QOS)
+
+        # ── ROS 2 publisher: gimbal commands via VehicleCommand ──
+        self.vehicle_cmd_pub = self.create_publisher(
+            VehicleCommand, '/fmu/in/vehicle_command', 10)
+
+        # Drone position (for WAITING → SEARCHING trigger)
+        # Note: PX4 publishes _v1 versioned topic
+        self.create_subscription(
+            VehicleLocalPosition,
+            '/fmu/out/vehicle_local_position_v1',
+            self._on_local_position, PX4_QOS)
+        self.drone_pos = None  # (north, east, down) in NED
+        self.at_position_since = None  # timestamp when drone first reached position
+
+        # YOLOv8
         self.model = YOLO(YOLO_MODEL)
         self.model.to('cuda' if __import__('torch').cuda.is_available() else 'cpu')
 
-        # Actual gimbal angles (updated from Gazebo joint state feedback)
+        # Actual gimbal angles (updated from PX4 attitude feedback)
         self.actual_yaw = 0.0
         self.actual_pitch = SEARCH_PITCH
         self.joint_state_received = False
-        self._joint_lock = threading.Lock()
 
-        # Subscribe to joint state via native gz.transport (no subprocess)
-        if not _gz_node.subscribe(GzModel,
-                                   GZ_JOINT_STATE_TOPIC,
-                                   self._on_joint_state):
-            self.get_logger().warn(
-                f'Failed to subscribe to {GZ_JOINT_STATE_TOPIC}')
-
-        # Commanded gimbal angles (what we last sent to Gazebo)
+        # Commanded gimbal angles
         self.cmd_yaw = SEARCH_YAW
         self.cmd_pitch = SEARCH_PITCH
 
-        # Tracking state — start in WAITING (no gimbal commands during takeoff)
+        # Tracking state
         self.state = State.WAITING
-        self.start_time = time.time()
         self.last_target_center = None
         self.last_detection_time = 0.0
         self.acquiring_count = 0
         self.frame_num = 0
+        self.last_configure_time = 0.0  # for periodic CONFIGURE re-send
+        self.gimbal_control_claimed = False
 
         # Display window
         cv2.namedWindow('Gimbal Tracker', cv2.WINDOW_NORMAL)
 
-        # ── Frame saving for YOLO training ───────────────────────
+        # Frame saving
         if SAVE_FRAMES:
-            import os
             os.makedirs(FRAMES_DIR, exist_ok=True)
             self.get_logger().info(
                 f'Saving frames {SAVE_FRAME_START}-{SAVE_FRAME_END} '
                 f'to {FRAMES_DIR}/')
 
-        # ── CSV log file ──────────────────────────────────────────
+        # CSV log
         self.log_file = open(LOG_PATH, 'w', newline='')
         self.log_writer = csv.writer(self.log_file)
         self.log_writer.writerow([
@@ -199,39 +193,78 @@ class GimbalTracker(Node):
         ])
         self.log_file.flush()
 
-        # Do NOT send gimbal commands yet — wait for drone to reach position
         self.get_logger().info(
-            f'Gimbal tracker initialized — WAITING {STARTUP_DELAY:.0f}s '
-            f'for drone to reach viewing position, '
+            f'Gimbal tracker initialized (PX4 VehicleCommand) — '
+            f'WAITING for drone at N:{VIEW_POS_NORTH} E:{VIEW_POS_EAST}, '
             f'logging to {LOG_PATH}')
 
-    def _on_joint_state(self, msg):
-        """Callback for native gz.transport joint state subscriber.
+    # ── Gimbal control authority ────────────────────────────────
 
-        Called on gz.transport's internal thread whenever new joint state
-        is published by the JointStatePublisher plugin in Gazebo.
-        The msg is a gz.msgs.Model protobuf with repeated Joint entries.
+    def _claim_gimbal_control(self):
+        """Send MAV_CMD_DO_GIMBAL_MANAGER_CONFIGURE to claim primary control.
+
+        PX4's gimbal manager denies all PITCHYAW commands until a controller
+        has been configured. This sets our sysid/compid as primary controller.
         """
-        # Handle raw bytes if gz.transport passes serialized protobuf
-        if isinstance(msg, (bytes, memoryview)):
-            model = GzModel()
-            model.ParseFromString(bytes(msg))
-            msg = model
+        msg = VehicleCommand()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        msg.command = 1001   # MAV_CMD_DO_GIMBAL_MANAGER_CONFIGURE
+        msg.param1 = 1.0    # primary control sysid (match source_system)
+        msg.param2 = 1.0    # primary control compid (match source_component)
+        msg.param3 = -1.0   # secondary control sysid (-1 = leave unchanged)
+        msg.param4 = -1.0   # secondary control compid (-1 = leave unchanged)
+        msg.param5 = 0.0
+        msg.param6 = 0.0
+        msg.param7 = 0.0    # gimbal device ID (0 = primary)
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        self.vehicle_cmd_pub.publish(msg)
+        self.get_logger().info('Sent GIMBAL_MANAGER_CONFIGURE — claiming control')
 
-        yaw = pitch = None
-        for joint in msg.joint:
-            if joint.name == JOINT_YAW:
-                yaw = joint.axis1.position
-            elif joint.name == JOINT_PITCH:
-                pitch = joint.axis1.position
+    # ── Gimbal command (through PX4 VehicleCommand) ────────────
 
-        with self._joint_lock:
-            if yaw is not None:
-                self.actual_yaw = yaw
-            if pitch is not None:
-                self.actual_pitch = pitch
-            if yaw is not None or pitch is not None:
-                self.joint_state_received = True
+    def _send_gimbal(self, pitch_rad, yaw_rad):
+        """Send gimbal command through PX4 via MAV_CMD_DO_GIMBAL_MANAGER_PITCHYAW.
+
+        Uses PITCH_LOCK (earth-frame pitch stabilization).
+        Yaw is vehicle-relative (yaw=0 = forward).
+        """
+        msg = VehicleCommand()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        msg.command = 1000   # MAV_CMD_DO_GIMBAL_MANAGER_PITCHYAW
+        msg.param1 = math.degrees(pitch_rad)  # pitch angle (deg)
+        msg.param2 = math.degrees(yaw_rad)    # yaw angle (deg)
+        msg.param3 = float('nan')             # pitch rate (NaN = position mode)
+        msg.param4 = float('nan')             # yaw rate (NaN = position mode)
+        msg.param5 = 8.0                      # PITCH_LOCK only (earth-frame pitch)
+        msg.param6 = 0.0
+        msg.param7 = 0.0                      # gimbal device ID (0 = primary)
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        self.vehicle_cmd_pub.publish(msg)
+
+    # ── Gimbal feedback from PX4 ───────────────────────────────
+
+    def _on_gimbal_attitude(self, msg):
+        """Callback: actual gimbal orientation from PX4."""
+        pitch, yaw = quaternion_to_pitch_yaw(msg.q)
+        self.actual_pitch = pitch
+        self.actual_yaw = yaw
+        self.joint_state_received = True
+
+    # ── Drone position feedback ──────────────────────────────
+
+    def _on_local_position(self, msg):
+        """Callback: drone NED position from PX4."""
+        self.drone_pos = (msg.x, msg.y, msg.z)
+
+    # ── Camera frame processing ────────────────────────────────
 
     def on_image(self, msg):
         frame = self.br.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -239,28 +272,75 @@ class GimbalTracker(Node):
         now = time.time()
         self.frame_num += 1
 
-        # ── WAITING state: no detection, no gimbal commands ──────
+        # Periodically re-send CONFIGURE to maintain gimbal control
+        if (self.gimbal_control_claimed and
+                now - self.last_configure_time > 5.0):
+            self._claim_gimbal_control()
+            self.last_configure_time = now
+
+        # ── Claim gimbal control as soon as PX4 feedback arrives ─
+        if not self.gimbal_control_claimed and self.joint_state_received:
+            self._claim_gimbal_control()
+            self.gimbal_control_claimed = True
+            self.last_configure_time = now
+            # Send forward-looking stabilized pose during transit
+            self._send_gimbal(SEARCH_PITCH, SEARCH_YAW)
+            self.get_logger().info(
+                'Gimbal control claimed — stabilizing during transit')
+
+        # ── WAITING state: wait for drone to reach viewing position ─
         if self.state == State.WAITING:
-            elapsed = now - self.start_time
-            remaining = STARTUP_DELAY - elapsed
-            if remaining <= 0:
-                # Drone should be at viewing position — reset gimbal
-                set_gimbal(GIMBAL_TOPIC_PITCH, SEARCH_PITCH)
-                set_gimbal(GIMBAL_TOPIC_YAW, SEARCH_YAW)
+            # Keep sending stabilized pose during transit
+            if self.gimbal_control_claimed:
+                self._send_gimbal(SEARCH_PITCH, SEARCH_YAW)
+
+            dist = None
+            in_range = False
+            if self.drone_pos is not None:
+                n, e, d = self.drone_pos
+                dist = math.sqrt(
+                    (n - VIEW_POS_NORTH) ** 2 +
+                    (e - VIEW_POS_EAST) ** 2 +
+                    (d - VIEW_POS_DOWN) ** 2)
+                in_range = dist < VIEW_POS_TOLERANCE
+
+            # Track dwell time — drone must stay in range for VIEW_POS_DWELL
+            if in_range:
+                if self.at_position_since is None:
+                    self.at_position_since = now
+                    self.get_logger().info(
+                        f'Drone in range (dist={dist:.1f}m), '
+                        f'dwelling {VIEW_POS_DWELL:.0f}s...')
+                dwell = now - self.at_position_since
+            else:
+                if self.at_position_since is not None:
+                    self.get_logger().info('Drone left range, resetting dwell.')
+                self.at_position_since = None
+                dwell = 0.0
+
+            if in_range and dwell >= VIEW_POS_DWELL:
+                self._send_gimbal(SEARCH_PITCH, SEARCH_YAW)
                 self.cmd_pitch = SEARCH_PITCH
                 self.cmd_yaw = SEARCH_YAW
                 self.state = State.SEARCHING
                 self.get_logger().info(
-                    f'Startup delay complete — gimbal reset to '
-                    f'P:{math.degrees(SEARCH_PITCH):.0f}° Y:0° — '
-                    f'SEARCHING')
+                    f'Drone stable at position for {dwell:.0f}s — '
+                    f'gimbal set to P:{math.degrees(SEARCH_PITCH):.0f} '
+                    f'Y:0 — SEARCHING')
             else:
-                # Show waiting overlay and save frames, but skip detection
                 if (SAVE_FRAMES and
                         SAVE_FRAME_START <= self.frame_num <= SAVE_FRAME_END):
                     cv2.imwrite(
                         f'{FRAMES_DIR}/frame_{self.frame_num:06d}.jpg', frame)
-                cv2.putText(frame, f'[WAITING] {remaining:.0f}s',
+                if dist is not None:
+                    if in_range:
+                        remaining = VIEW_POS_DWELL - dwell
+                        status = f'holding {remaining:.0f}s'
+                    else:
+                        status = f'dist:{dist:.0f}m'
+                else:
+                    status = 'no position'
+                cv2.putText(frame, f'[WAITING] {status}',
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.8, (128, 128, 128), 2)
                 cv2.putText(frame, f'F:{self.frame_num}', (10, 55),
@@ -269,14 +349,12 @@ class GimbalTracker(Node):
                 cv2.waitKey(1)
                 return
 
-        # Run YOLOv8 detection (cars only)
+        # Run YOLOv8 detection
         results = self.model.predict(
             frame, classes=[TARGET_CLASS], conf=CONF_THRESHOLD, verbose=False)
-
-        # Select best target
         target = self._select_target(results, w, h)
 
-        # Per-frame log data (defaults for no-detection)
+        # Per-frame log defaults
         log_detected = 0
         log_det_cx = log_det_cy = 0.0
         log_det_w = log_det_h = 0.0
@@ -286,35 +364,31 @@ class GimbalTracker(Node):
         log_target_yaw = self.cmd_yaw
         log_target_pitch = self.cmd_pitch
 
-        # ── State machine ─────────────────────────────────────────
+        # ── State machine ──────────────────────────────────────
         if target is not None:
             tcx, tcy, x1, y1, x2, y2, conf = target
             self.last_detection_time = now
             self.last_target_center = (tcx, tcy)
 
             log_detected = 1
-            log_det_cx = tcx
-            log_det_cy = tcy
-            log_det_w = x2 - x1
-            log_det_h = y2 - y1
+            log_det_cx, log_det_cy = tcx, tcy
+            log_det_w, log_det_h = x2 - x1, y2 - y1
             log_det_conf = conf
 
             if self.state == State.SEARCHING:
                 self.state = State.ACQUIRING
                 self.acquiring_count = 0
                 self.get_logger().info(
-                    f'Car detected at ({tcx:.0f}, {tcy:.0f}) conf={conf:.2f} — acquiring...')
-
+                    f'Car detected at ({tcx:.0f}, {tcy:.0f}) '
+                    f'conf={conf:.2f} — acquiring...')
             elif self.state == State.LOST:
                 self.state = State.TRACKING
                 self.get_logger().info('Car re-acquired — tracking.')
 
-            # Compute and apply gimbal correction
             log_err_px_x, log_err_px_y, log_err_ang_x, log_err_ang_y, \
                 log_target_yaw, log_target_pitch = self._track_target(
                     tcx, tcy, w, h)
 
-            # Check if acquired (centered for N consecutive frames)
             if self.state == State.ACQUIRING:
                 err_px = math.sqrt(
                     (tcx - w / 2) ** 2 + (tcy - h / 2) ** 2)
@@ -325,16 +399,16 @@ class GimbalTracker(Node):
                         self.get_logger().info('Target acquired — tracking.')
                 else:
                     self.acquiring_count = 0
-
         else:
-            # No detection this frame
-            if self.state in (State.TRACKING, State.ACQUIRING):
+            # No target — keep sending search pose during SEARCHING
+            if self.state == State.SEARCHING:
+                self._send_gimbal(SEARCH_PITCH, SEARCH_YAW)
+            elif self.state in (State.TRACKING, State.ACQUIRING):
                 self.state = State.LOST
                 self.get_logger().info(
                     f'Target lost at frame {self.frame_num} — '
-                    f'actual P:{math.degrees(self.actual_pitch):+.1f}° '
-                    f'Y:{math.degrees(self.actual_yaw):+.1f}°')
-
+                    f'actual P:{math.degrees(self.actual_pitch):+.1f} '
+                    f'Y:{math.degrees(self.actual_yaw):+.1f}')
             elif self.state == State.LOST:
                 elapsed = now - self.last_detection_time
                 if elapsed >= HOLD_TIME:
@@ -344,7 +418,7 @@ class GimbalTracker(Node):
                         self.state = State.SEARCHING
                         self.get_logger().info('Returned to search pose.')
 
-        # ── Write CSV log row ─────────────────────────────────────
+        # ── CSV log ────────────────────────────────────────────
         self.log_writer.writerow([
             self.frame_num, f'{now:.3f}', self.state.name,
             log_detected,
@@ -362,28 +436,23 @@ class GimbalTracker(Node):
         if self.frame_num % 50 == 0:
             self.log_file.flush()
 
-        # ── Save raw frames (before overlay) for YOLO training ────
+        # ── Save frames ───────────────────────────────────────
         if (SAVE_FRAMES and
                 SAVE_FRAME_START <= self.frame_num <= SAVE_FRAME_END):
             cv2.imwrite(
                 f'{FRAMES_DIR}/frame_{self.frame_num:06d}.jpg', frame)
 
-        # ── Draw overlay and display ──────────────────────────────
+        # ── Overlay + display ──────────────────────────────────
         self._draw_overlay(frame, target, w, h)
         cv2.imshow('Gimbal Tracker', frame)
         cv2.waitKey(1)
 
-    # ── Target selection ──────────────────────────────────────────
+    # ── Target selection ───────────────────────────────────────
 
     def _select_target(self, results, img_w, img_h):
-        """Pick the best car detection to track.
-
-        Returns (cx, cy, x1, y1, x2, y2, conf) or None.
-        """
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
             return None
-
         xyxy = boxes.xyxy
         if len(xyxy) == 0:
             return None
@@ -393,14 +462,10 @@ class GimbalTracker(Node):
             centers_x = (xyxy[:, 0] + xyxy[:, 2]) / 2
             centers_y = (xyxy[:, 1] + xyxy[:, 3]) / 2
             lx, ly = self.last_target_center
-            dx = centers_x - lx
-            dy = centers_y - ly
-            distances = (dx ** 2 + dy ** 2).sqrt()
-
+            distances = ((centers_x - lx) ** 2 + (centers_y - ly) ** 2).sqrt()
             valid_mask = distances <= MAX_TARGET_JUMP_PX
             if not valid_mask.any():
                 return None
-
             distances[~valid_mask] = float('inf')
             best_idx = distances.argmin().item()
         else:
@@ -409,85 +474,64 @@ class GimbalTracker(Node):
 
         box = xyxy[best_idx]
         x1, y1, x2, y2 = box.tolist()
-        cx = (x1 + x2) / 2
-        cy = (y1 + y2) / 2
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
         conf = float(boxes.conf[best_idx])
         return (cx, cy, x1, y1, x2, y2, conf)
 
-    # ── Closed-loop P gimbal control ─────────────────────────────
+    # ── Closed-loop P gimbal control ──────────────────────────
 
     def _track_target(self, target_cx, target_cy, img_w, img_h):
-        """Compute ABSOLUTE target angles using actual gimbal feedback.
-
-        Instead of accumulating incremental deltas (which drifts), we:
-        1. Read actual gimbal angle from joint state feedback
-        2. Compute angular error from pixel offset
-        3. target = actual + Kp * error  (absolute position command)
-        4. Publish target to Gazebo JointPositionController
-
-        This matches the industry-standard approach used by DJI ActiveTrack,
-        SimpleBGC, and every servo-based face tracker.
-
-        Returns (err_px_x, err_px_y, err_ang_x, err_ang_y,
-                 target_yaw, target_pitch) for logging.
-        """
-        # Pixel error from image center
+        """Compute target angles and send through PX4."""
         err_px_x = target_cx - img_w / 2.0
         err_px_y = target_cy - img_h / 2.0
-        raw_err_px_x = err_px_x
-        raw_err_px_y = err_px_y
+        raw_err_px_x, raw_err_px_y = err_px_x, err_px_y
 
-        # Deadzone — suppress jitter when nearly centered
         if abs(err_px_x) < DEADZONE_PX:
             err_px_x = 0.0
         if abs(err_px_y) < DEADZONE_PX:
             err_px_y = 0.0
 
-        # Convert pixel error to angular error (radians)
         vfov = HFOV * (img_h / img_w)
         err_ang_x = err_px_x * (HFOV / img_w)
         err_ang_y = err_px_y * (vfov / img_h)
 
-        # Absolute target computation:
-        #   Sign convention (verified empirically with gimbal_diag.py):
-        #   - PITCH: negative = camera looks DOWN, positive = looks UP
-        #     Car BELOW center → positive err_ang_y → decrease pitch → look more down
-        #   - YAW: negative yaw → FOV pans LEFT, positive yaw → FOV pans RIGHT
-        #     Car RIGHT of center → positive err_ang_x → increase yaw → pan right
-        target_yaw = self.actual_yaw + Kp * err_ang_x
-        target_pitch = self.actual_pitch - Kp * err_ang_y
+        # YAW: use cmd_yaw (vehicle-relative) — NOT actual_yaw (world-frame)
+        # because with flags=8 (PITCH_LOCK only), yaw commands are
+        # vehicle-relative but GimbalDeviceAttitudeStatus reports world-frame.
+        # PITCH: use actual_pitch — both command and feedback are earth-frame
+        # with PITCH_LOCK, so closed-loop feedback is correct.
+        desired_yaw = self.cmd_yaw + Kp * err_ang_x
+        desired_pitch = self.actual_pitch - Kp * err_ang_y
 
-        # Clamp to gimbal limits
+        # Limit step size per frame to prevent overshoot / oscillation
+        d_yaw = max(-MAX_STEP_RAD, min(MAX_STEP_RAD,
+                                       desired_yaw - self.cmd_yaw))
+        d_pitch = max(-MAX_STEP_RAD, min(MAX_STEP_RAD,
+                                         desired_pitch - self.cmd_pitch))
+        target_yaw = self.cmd_yaw + d_yaw
+        target_pitch = self.cmd_pitch + d_pitch
+
         target_yaw = max(GIMBAL_YAW_MIN, min(GIMBAL_YAW_MAX, target_yaw))
         target_pitch = max(GIMBAL_PITCH_MIN, min(GIMBAL_PITCH_MAX, target_pitch))
 
-        # Publish to Gazebo — the JointPositionController will slew
-        # to the target at cmd_max=1.0 rad/s (57°/s)
-        set_gimbal(GIMBAL_TOPIC_YAW, target_yaw)
-        set_gimbal(GIMBAL_TOPIC_PITCH, target_pitch)
+        self._send_gimbal(target_pitch, target_yaw)
         self.cmd_yaw = target_yaw
         self.cmd_pitch = target_pitch
 
         return (raw_err_px_x, raw_err_px_y, err_ang_x, err_ang_y,
                 target_yaw, target_pitch)
 
-    # ── Return to search pose ─────────────────────────────────────
+    # ── Return to search pose ─────────────────────────────────
 
     def _return_to_search(self):
-        """Smoothly slew gimbal back to the search pose."""
-        # Just command the search pose directly — the JointPositionController
-        # will slew there at cmd_max speed.  No need for manual stepping.
-        set_gimbal(GIMBAL_TOPIC_PITCH, SEARCH_PITCH)
-        set_gimbal(GIMBAL_TOPIC_YAW, SEARCH_YAW)
+        self._send_gimbal(SEARCH_PITCH, SEARCH_YAW)
         self.cmd_pitch = SEARCH_PITCH
         self.cmd_yaw = SEARCH_YAW
 
-    # ── Visual overlay ────────────────────────────────────────────
+    # ── Visual overlay ────────────────────────────────────────
 
     def _draw_overlay(self, frame, target, w, h):
-        """Draw tracking HUD on the frame."""
         cx, cy = w // 2, h // 2
-
         cv2.line(frame, (cx - 25, cy), (cx + 25, cy), (0, 255, 0), 1)
         cv2.line(frame, (cx, cy - 25), (cx, cy + 25), (0, 255, 0), 1)
 
@@ -505,11 +549,10 @@ class GimbalTracker(Node):
         cv2.putText(frame, f'F:{self.frame_num}', (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        # Show ACTUAL angles (from joint state) and whether feedback is active
-        pitch_deg = math.degrees(self.actual_pitch)
-        yaw_deg = math.degrees(self.actual_yaw)
-        fb = 'FB' if self.joint_state_received else 'OL'
-        angle_text = f'P:{pitch_deg:+.1f} Y:{yaw_deg:+.1f} [{fb}]'
+        cmd_pitch_deg = math.degrees(self.cmd_pitch)
+        cmd_yaw_deg = math.degrees(self.cmd_yaw)
+        fb = 'PX4' if self.joint_state_received else 'OL'
+        angle_text = f'P:{cmd_pitch_deg:+.1f} Y:{cmd_yaw_deg:+.1f} [{fb}]'
         text_size = cv2.getTextSize(
             angle_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
         cv2.putText(frame, angle_text, (w - text_size[0] - 10, 30),
@@ -524,9 +567,7 @@ class GimbalTracker(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             cv2.arrowedLine(frame, (cx, cy), (int(tcx), int(tcy)),
                             (0, 165, 255), 2, tipLength=0.15)
-            err_x = tcx - cx
-            err_y = tcy - cy
-            cv2.putText(frame, f'err: ({err_x:+.0f}, {err_y:+.0f})px',
+            cv2.putText(frame, f'err: ({tcx - cx:+.0f}, {tcy - cy:+.0f})px',
                         (10, h - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
