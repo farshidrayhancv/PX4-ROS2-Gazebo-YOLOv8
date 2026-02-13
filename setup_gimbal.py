@@ -147,6 +147,31 @@ def add_depth_sensor(camera_link):
     return True
 
 
+def add_joint_state_publisher(model):
+    """Add JointStatePublisher plugin so the tracker can read actual gimbal angles."""
+    # Check if already added
+    for plugin in model.findall("plugin"):
+        if "JointStatePublisher" in plugin.get("name", ""):
+            print("  JointStatePublisher already exists, skipping.")
+            return False
+
+    plugin = ET.SubElement(model, "plugin")
+    plugin.set("filename", "gz-sim-joint-state-publisher-system")
+    plugin.set("name", "gz::sim::systems::JointStatePublisher")
+
+    # Publish all 4 gimbal joints
+    for joint_name in [
+        "cgo3_mount_joint",           # roll
+        "cgo3_vertical_arm_joint",    # yaw
+        "cgo3_horizontal_arm_joint",  # roll arm
+        "cgo3_camera_joint",          # pitch (camera tilt)
+    ]:
+        j = ET.SubElement(plugin, "joint_name")
+        j.text = joint_name
+
+    return True
+
+
 def main():
     tree = ET.parse(MODEL_PATH)
     root = tree.getroot()
@@ -161,6 +186,10 @@ def main():
     n = tune_pid_gains(model)
     print(f"  {n} JointPositionControllers tuned (P={PID_OVERRIDES['p_gain']}, "
           f"D={PID_OVERRIDES['d_gain']}, cmd_max={PID_OVERRIDES['cmd_max']})")
+
+    # 3b. Add JointStatePub for closed-loop gimbal tracking
+    if add_joint_state_publisher(model):
+        print("  JointStatePub added (roll, yaw, pitch joints)")
 
     # 3. Add thermal camera
     camera_link = None
