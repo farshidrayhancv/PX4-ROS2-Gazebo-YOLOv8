@@ -1,72 +1,151 @@
 #!/usr/bin/env python3
-"""Modify x500_depth model SDF to replace fixed camera joint with a 3-axis gimbal.
+"""Modify the x500_gimbal's gimbal model for the simulation.
 
-Run during Docker build to add pitch/yaw/roll gimbal joints and
-JointPositionController plugins so the camera angle can be controlled
-at runtime via gz topics.
+1. Tunes PID gains for smoother gimbal tracking.
+2. Adds a thermal camera sensor co-located with the RGB camera.
+3. Adds a depth camera sensor co-located with the RGB camera.
+4. Adds JointStatePublisher for diagnostics.
+
+Gimbal commands flow through PX4's MAVLink gimbal protocol v2
+(GZGimbal bridge publishes to 'command/gimbal_*' topics).
+
+Run during Docker build after PX4 is built.
 """
 
 import xml.etree.ElementTree as ET
 
-MODEL_PATH = "/root/PX4-Autopilot/Tools/simulation/gz/models/x500_depth/model.sdf"
+MODEL_PATH = "/root/PX4-Autopilot/Tools/simulation/gz/models/gimbal/model.sdf"
 
-# Camera mount point on the drone body
-MOUNT_X = 0.15
-MOUNT_Y = 0.029
-MOUNT_Z = 0.21
-
-# Initial pitch angle (radians) — 45 degrees downward
-INITIAL_PITCH = 0.7854
-
-
-def add_link(model, name, relative_to, pose_text):
-    """Add a lightweight link for a gimbal axis."""
-    link = ET.SubElement(model, "link", name=name)
-    pose = ET.SubElement(link, "pose")
-    pose.set("relative_to", relative_to)
-    pose.text = pose_text
-    inertial = ET.SubElement(link, "inertial")
-    mass = ET.SubElement(inertial, "mass")
-    mass.text = "0.01"
-    inertia = ET.SubElement(inertial, "inertia")
-    for tag in ["ixx", "iyy", "izz"]:
-        ET.SubElement(inertia, tag).text = "0.00001"
-    for tag in ["ixy", "ixz", "iyz"]:
-        ET.SubElement(inertia, tag).text = "0"
-    return link
+# PID tuning: increase responsiveness for smoother tracking of continuous
+# position commands.  Stock values are very conservative (P≈0.3-0.8,
+# cmd_max=0.3) which causes visible lag when the keyboard sends small
+# incremental steps.
+PID_OVERRIDES = {
+    "p_gain": "2.0",
+    "d_gain": "0.1",
+    "cmd_max": "1.0",
+    "cmd_min": "-1.0",
+}
 
 
-def add_revolute_joint(model, name, parent, child, axis_xyz,
-                       lower, upper, effort=0.3, damping=3.0):
-    """Add a revolute joint between two links."""
-    joint = ET.SubElement(model, "joint", name=name, type="revolute")
-    ET.SubElement(joint, "parent").text = parent
-    ET.SubElement(joint, "child").text = child
-    axis = ET.SubElement(joint, "axis")
-    ET.SubElement(axis, "xyz").text = axis_xyz
-    limit = ET.SubElement(axis, "limit")
-    ET.SubElement(limit, "lower").text = str(lower)
-    ET.SubElement(limit, "upper").text = str(upper)
-    ET.SubElement(limit, "effort").text = str(effort)
-    dynamics = ET.SubElement(axis, "dynamics")
-    ET.SubElement(dynamics, "damping").text = str(damping)
-    return joint
+def tune_pid_gains(model):
+    """Increase PID responsiveness on JointPositionController plugins."""
+    count = 0
+    for plugin in model.findall("plugin"):
+        name = plugin.get("name", "")
+        if "JointPositionController" not in name:
+            continue
+        for tag, value in PID_OVERRIDES.items():
+            elem = plugin.find(tag)
+            if elem is not None:
+                elem.text = value
+            else:
+                elem = ET.SubElement(plugin, tag)
+                elem.text = value
+        count += 1
+    return count
 
 
-def add_controller(model, joint_name, topic, initial=0):
-    """Add a JointPositionController plugin."""
-    ctrl = ET.SubElement(model, "plugin",
-                         filename="gz-sim-joint-position-controller-system",
-                         name="gz::sim::systems::JointPositionController")
-    ET.SubElement(ctrl, "joint_name").text = joint_name
-    ET.SubElement(ctrl, "topic").text = topic
-    ET.SubElement(ctrl, "p_gain").text = "1.0"
-    ET.SubElement(ctrl, "i_gain").text = "0"
-    ET.SubElement(ctrl, "d_gain").text = "0.1"
-    ET.SubElement(ctrl, "cmd_max").text = "0.3"
-    ET.SubElement(ctrl, "cmd_min").text = "-0.3"
-    ET.SubElement(ctrl, "initial_position").text = str(initial)
-    return ctrl
+def add_thermal_sensor(camera_link):
+    """Add a thermal camera sensor to the gimbal's camera_link."""
+    # Check if thermal sensor already exists
+    for sensor in camera_link.findall("sensor"):
+        if sensor.get("name") == "thermal_camera":
+            print("  Thermal camera sensor already exists, skipping.")
+            return False
+
+    sensor = ET.SubElement(camera_link, "sensor")
+    sensor.set("name", "thermal_camera")
+    sensor.set("type", "thermal")
+
+    pose = ET.SubElement(sensor, "pose")
+    pose.text = "-0.0412 0 -0.162 0 0 3.14"
+
+    gz_frame = ET.SubElement(sensor, "gz_frame_id")
+    gz_frame.text = "camera_link"
+
+    camera = ET.SubElement(sensor, "camera")
+
+    hfov = ET.SubElement(camera, "horizontal_fov")
+    hfov.text = "1.047"
+
+    image = ET.SubElement(camera, "image")
+    ET.SubElement(image, "width").text = "320"
+    ET.SubElement(image, "height").text = "240"
+    ET.SubElement(image, "format").text = "L16"
+
+    clip = ET.SubElement(camera, "clip")
+    ET.SubElement(clip, "near").text = "0.1"
+    ET.SubElement(clip, "far").text = "100"
+
+    ET.SubElement(sensor, "always_on").text = "1"
+    ET.SubElement(sensor, "update_rate").text = "10"
+    ET.SubElement(sensor, "visualize").text = "true"
+
+    return True
+
+
+def add_depth_sensor(camera_link):
+    """Add a depth camera sensor to the gimbal's camera_link."""
+    for sensor in camera_link.findall("sensor"):
+        if sensor.get("name") == "depth_camera":
+            print("  Depth camera sensor already exists, skipping.")
+            return False
+
+    sensor = ET.SubElement(camera_link, "sensor")
+    sensor.set("name", "depth_camera")
+    sensor.set("type", "depth_camera")
+
+    pose = ET.SubElement(sensor, "pose")
+    pose.text = "-0.0412 0 -0.162 0 0 3.14"
+
+    gz_frame = ET.SubElement(sensor, "gz_frame_id")
+    gz_frame.text = "camera_link"
+
+    camera = ET.SubElement(sensor, "camera")
+
+    hfov = ET.SubElement(camera, "horizontal_fov")
+    hfov.text = "1.274"
+
+    image = ET.SubElement(camera, "image")
+    ET.SubElement(image, "width").text = "640"
+    ET.SubElement(image, "height").text = "480"
+    ET.SubElement(image, "format").text = "R_FLOAT32"
+
+    clip = ET.SubElement(camera, "clip")
+    ET.SubElement(clip, "near").text = "0.2"
+    ET.SubElement(clip, "far").text = "100"
+
+    ET.SubElement(sensor, "always_on").text = "1"
+    ET.SubElement(sensor, "update_rate").text = "10"
+    ET.SubElement(sensor, "visualize").text = "true"
+
+    return True
+
+
+def add_joint_state_publisher(model):
+    """Add JointStatePublisher plugin so the tracker can read actual gimbal angles."""
+    # Check if already added
+    for plugin in model.findall("plugin"):
+        if "JointStatePublisher" in plugin.get("name", ""):
+            print("  JointStatePublisher already exists, skipping.")
+            return False
+
+    plugin = ET.SubElement(model, "plugin")
+    plugin.set("filename", "gz-sim-joint-state-publisher-system")
+    plugin.set("name", "gz::sim::systems::JointStatePublisher")
+
+    # Publish all 4 gimbal joints
+    for joint_name in [
+        "cgo3_mount_joint",           # roll
+        "cgo3_vertical_arm_joint",    # yaw
+        "cgo3_horizontal_arm_joint",  # roll arm
+        "cgo3_camera_joint",          # pitch (camera tilt)
+    ]:
+        j = ET.SubElement(plugin, "joint_name")
+        j.text = joint_name
+
+    return True
 
 
 def main():
@@ -74,43 +153,36 @@ def main():
     root = tree.getroot()
     model = root.find("model")
 
-    # Remove the existing fixed CameraJoint
-    for joint in model.findall("joint"):
-        if joint.get("name") == "CameraJoint":
-            model.remove(joint)
+    print(f"Modifying gimbal model: {MODEL_PATH}")
+
+    # 1. Tune PID for smoother, more responsive gimbal tracking
+    n = tune_pid_gains(model)
+    print(f"  {n} JointPositionControllers tuned (P={PID_OVERRIDES['p_gain']}, "
+          f"D={PID_OVERRIDES['d_gain']}, cmd_max={PID_OVERRIDES['cmd_max']})")
+
+    # 3b. Add JointStatePub for closed-loop gimbal tracking
+    if add_joint_state_publisher(model):
+        print("  JointStatePub added (roll, yaw, pitch joints)")
+
+    # 3. Add thermal camera
+    camera_link = None
+    for link in model.findall("link"):
+        if link.get("name") == "camera_link":
+            camera_link = link
             break
 
-    # Update OakD-Lite include pose (remove tilt, gimbal handles it)
-    for include in model.findall("include"):
-        uri = include.find("uri")
-        if uri is not None and "OakD" in uri.text:
-            pose = include.find("pose")
-            if pose is not None:
-                pose.text = f"{MOUNT_X} {MOUNT_Y} {MOUNT_Z} 0 0 0"
-            break
+    if camera_link is None:
+        print(f"ERROR: camera_link not found in {MODEL_PATH}")
+    else:
+        if add_thermal_sensor(camera_link):
+            print(f"  Thermal camera added (320x240, L16, 10 Hz)")
 
-    # Chain: base_link → (yaw) → gimbal_yaw_link → (roll) → gimbal_roll_link → (pitch) → camera_link
-    mount_pose = f"{MOUNT_X} {MOUNT_Y} {MOUNT_Z} 0 0 0"
-
-    add_link(model, "gimbal_yaw_link", "base_link", mount_pose)
-    add_link(model, "gimbal_roll_link", "gimbal_yaw_link", "0 0 0 0 0 0")
-
-    add_revolute_joint(model, "gimbal_yaw_joint", "base_link", "gimbal_yaw_link",
-                       axis_xyz="0 0 1", lower=-1.57, upper=1.57)
-    add_revolute_joint(model, "gimbal_roll_joint", "gimbal_yaw_link", "gimbal_roll_link",
-                       axis_xyz="1 0 0", lower=-0.785, upper=0.785)
-    add_revolute_joint(model, "gimbal_pitch_joint", "gimbal_roll_link", "camera_link",
-                       axis_xyz="0 1 0", lower=-1.57, upper=0.5)
-
-    add_controller(model, "gimbal_yaw_joint", "/gimbal/cmd_yaw", initial=0)
-    add_controller(model, "gimbal_roll_joint", "/gimbal/cmd_roll", initial=0)
-    add_controller(model, "gimbal_pitch_joint", "/gimbal/cmd_pitch", initial=INITIAL_PITCH)
+        # 4. Add depth camera
+        if add_depth_sensor(camera_link):
+            print(f"  Depth camera added (640x480, R_FLOAT32, 10 Hz)")
 
     ET.indent(tree, space="  ")
     tree.write(MODEL_PATH, xml_declaration=True, encoding="UTF-8")
-    print(f"3-axis gimbal added to {MODEL_PATH}")
-    print(f"  Initial pitch: {INITIAL_PITCH} rad ({INITIAL_PITCH * 180 / 3.14159:.1f} deg)")
-    print(f"  Topics: /gimbal/cmd_pitch, /gimbal/cmd_yaw, /gimbal/cmd_roll")
 
 
 if __name__ == "__main__":

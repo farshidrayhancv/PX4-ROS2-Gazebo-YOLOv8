@@ -73,6 +73,7 @@ def init():
     sys.stdout.write("  Arrows   : Roll / Pitch\n")
     sys.stdout.write("  j / k    : Gimbal pitch down / up\n")
     sys.stdout.write("  n / m    : Gimbal yaw left / right\n")
+    sys.stdout.write("  u / o    : Gimbal roll left / right\n")
     sys.stdout.write("  i        : Print flight mode\n")
     sys.stdout.write("  1        : Loiter mode\n")
     sys.stdout.write("  2        : AltHold mode\n")

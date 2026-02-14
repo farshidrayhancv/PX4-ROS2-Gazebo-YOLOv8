@@ -28,6 +28,20 @@
           <box><size>3.6 1.8 1.0</size></box>
         </geometry>
       </collision>
+
+      <!-- Underbody engine/exhaust heat — visible in thermal as a hot
+           region below the car. Thin box spanning the undercarriage. -->
+      <visual name="underbody_heat">
+        <pose>0.2 0 0.08 0 0 0</pose>
+        <geometry>
+          <box><size>2.8 1.4 0.05</size></box>
+        </geometry>
+        <material>
+          <ambient>0.02 0.02 0.02 1</ambient>
+          <diffuse>0.02 0.02 0.02 1</diffuse>
+        </material>
+        <transparency>1.0</transparency>
+      </visual>
     </link>
 
     <!-- ==================== FORWARD-FACING CAMERA ==================== -->
@@ -91,6 +105,9 @@
     </link>
 
     <!-- ==================== WHEEL LINKS ==================== -->
+    <!-- Wheels now have visuals (dark cylinders) so they appear in
+         the thermal camera as heat sources at ground level. -->
+
     <!-- Front Left Wheel -->
     <link name="front_left_wheel">
       <pose>1.6 0.75 0 -1.5707963 0 0</pose>
@@ -102,6 +119,15 @@
           <izz>0.8</izz>
         </inertia>
       </inertial>
+      <visual name="tire_visual">
+        <geometry>
+          <cylinder><radius>0.30</radius><length>0.20</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>0.05 0.05 0.05 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+        </material>
+      </visual>
       <collision name="collision">
         <geometry>
           <cylinder><radius>0.30</radius><length>0.20</length></cylinder>
@@ -128,6 +154,15 @@
           <izz>0.8</izz>
         </inertia>
       </inertial>
+      <visual name="tire_visual">
+        <geometry>
+          <cylinder><radius>0.30</radius><length>0.20</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>0.05 0.05 0.05 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+        </material>
+      </visual>
       <collision name="collision">
         <geometry>
           <cylinder><radius>0.30</radius><length>0.20</length></cylinder>
@@ -154,6 +189,15 @@
           <izz>0.8</izz>
         </inertia>
       </inertial>
+      <visual name="tire_visual">
+        <geometry>
+          <cylinder><radius>0.30</radius><length>0.20</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>0.05 0.05 0.05 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+        </material>
+      </visual>
       <collision name="collision">
         <geometry>
           <cylinder><radius>0.30</radius><length>0.20</length></cylinder>
@@ -180,6 +224,15 @@
           <izz>0.8</izz>
         </inertia>
       </inertial>
+      <visual name="tire_visual">
+        <geometry>
+          <cylinder><radius>0.30</radius><length>0.20</length></cylinder>
+        </geometry>
+        <material>
+          <ambient>0.05 0.05 0.05 1</ambient>
+          <diffuse>0.05 0.05 0.05 1</diffuse>
+        </material>
+      </visual>
       <collision name="collision">
         <geometry>
           <cylinder><radius>0.30</radius><length>0.20</length></cylinder>
@@ -270,6 +323,15 @@
         </limit>
       </axis>
     </joint>
+
+    <!-- ==================== THERMAL TEMPERATURE ==================== -->
+    <!-- Running car: ~45 C (318 K). Gazebo assigns this uniformly to
+         all visuals (body mesh + tires + underbody heat plane).
+         Limitation: can't do per-link gradient within one model. -->
+    <plugin filename="gz-sim-thermal-system"
+            name="gz::sim::systems::Thermal">
+      <temperature>318</temperature>
+    </plugin>
 
     <!-- ==================== ACKERMANN STEERING PLUGIN ==================== -->
     <plugin filename="gz-sim-ackermann-steering-system"
