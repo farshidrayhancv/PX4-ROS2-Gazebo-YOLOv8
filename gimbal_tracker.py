@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Gimbal car-tracking pipeline for PX4 drone simulation.
+"""Vision-based car tracking and drone flight control for PX4 simulation.
 
 Subscribes to /camera (ROS 2 Image), runs YOLOv8 to detect cars, and
-controls the gimbal (pitch + yaw) to keep the tracked car centered in
-the camera frame.
+controls both the gimbal AND drone flight to track the car autonomously.
 
-Architecture:
-  - Gimbal commands go through PX4 via VehicleCommand (MAV_CMD 1000):
-      tracker → /fmu/in/vehicle_command → PX4 gimbal manager
-        → pitch stabilization (IMU) → GZGimbal → Gazebo joints
-  - PX4 stabilizes pitch in earth frame (PITCH_LOCK): when the drone
-    tilts, the gimbal compensates to maintain horizon-relative pitch.
-  - Yaw follows vehicle heading (no YAW_LOCK): yaw=0 means forward.
-  - Feedback comes from PX4 via /fmu/out/gimbal_device_attitude_status.
-  - WAITING state triggers when drone reaches the viewing position
-    (position-based, not time-based).
+Architecture — two layers:
+  Layer 1 (Gimbal):
+    - Commands go through PX4 via VehicleCommand (MAV_CMD 1000)
+    - PX4 stabilizes pitch in earth frame (PITCH_LOCK)
+    - Yaw is vehicle-relative (yaw=0 = forward)
+    - Feedback from /fmu/out/gimbal_device_attitude_status
+
+  Layer 2 (Drone flight — offboard mode):
+    - Publishes TrajectorySetpoint + OffboardControlMode to PX4
+    - Yaw: rotates drone toward where gimbal is pointing (keeps gimbal centered)
+    - Position: follows car forward/backward to maintain ideal tracking pitch
+    - Altitude: held constant
 
 State machine:
   WAITING -> SEARCHING -> ACQUIRING -> TRACKING -> LOST -> SEARCHING
@@ -31,7 +32,8 @@ from enum import Enum, auto
 import cv2
 import rclpy
 from cv_bridge import CvBridge
-from px4_msgs.msg import (GimbalDeviceAttitudeStatus, VehicleCommand,
+from px4_msgs.msg import (GimbalDeviceAttitudeStatus, OffboardControlMode,
+                          TrajectorySetpoint, VehicleCommand,
                           VehicleLocalPosition)
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -55,6 +57,12 @@ HFOV = 1.047                # horizontal FOV in rad (60 deg), from model SDF
 Kp = 0.5                    # proportional gain (on angular error)
 MAX_STEP_RAD = 0.05         # max gimbal change per frame (~3 deg)
 DEADZONE_PX = 15            # pixel deadzone to prevent jitter
+
+# ── Drone flight control (offboard mode) ──────────────────────
+DRONE_YAW_Kp = 0.8            # fraction of gimbal yaw offset corrected per second
+DRONE_FOLLOW_SPEED_MAX = 3.0  # m/s max forward following speed
+IDEAL_TRACK_PITCH = SEARCH_PITCH  # rad (-55°) — ideal gimbal pitch for following
+PITCH_FOLLOW_GAIN = 4.0       # m/s per radian of pitch deviation from ideal
 
 # ── Detection settings ───────────────────────────────────────────
 YOLO_MODEL = os.path.join(os.path.dirname(__file__), 'assets', 'drone_car_yolov11n.pt')
@@ -133,9 +141,13 @@ class GimbalTracker(Node):
             '/fmu/out/gimbal_device_attitude_status',
             self._on_gimbal_attitude, PX4_QOS)
 
-        # ── ROS 2 publisher: gimbal commands via VehicleCommand ──
+        # ── ROS 2 publishers ───────────────────────────────────
         self.vehicle_cmd_pub = self.create_publisher(
             VehicleCommand, '/fmu/in/vehicle_command', 10)
+        self.offboard_mode_pub = self.create_publisher(
+            OffboardControlMode, '/fmu/in/offboard_control_mode', 10)
+        self.trajectory_pub = self.create_publisher(
+            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', 10)
 
         # Drone position (for WAITING → SEARCHING trigger)
         # Note: PX4 publishes _v1 versioned topic
@@ -166,7 +178,14 @@ class GimbalTracker(Node):
         self.acquiring_count = 0
         self.frame_num = 0
         self.last_configure_time = 0.0  # for periodic CONFIGURE re-send
+        self.last_frame_time = 0.0
         self.gimbal_control_claimed = False
+
+        # Offboard flight control state
+        self.offboard_active = False
+        self.offboard_pos = None     # [N, E, D] target position in NED
+        self.offboard_yaw = 0.0      # target heading (radians, NED, 0=north)
+        self.drone_heading = 0.0     # current heading from PX4
 
         # Display window
         cv2.namedWindow('Gimbal Tracker', cv2.WINDOW_NORMAL)
@@ -190,6 +209,7 @@ class GimbalTracker(Node):
             'target_yaw', 'target_pitch',
             'actual_yaw', 'actual_pitch',
             'actual_yaw_deg', 'actual_pitch_deg',
+            'offboard_yaw_deg', 'drone_speed',
         ])
         self.log_file.flush()
 
@@ -249,6 +269,110 @@ class GimbalTracker(Node):
         msg.from_external = True
         self.vehicle_cmd_pub.publish(msg)
 
+    # ── Offboard flight control ───────────────────────────────────
+
+    def _start_offboard(self):
+        """Switch PX4 to offboard mode with current position as hold target."""
+        if self.drone_pos is None:
+            self.get_logger().warn('Cannot start offboard: no drone position')
+            return
+
+        self.offboard_pos = list(self.drone_pos)
+        self.offboard_yaw = self.drone_heading
+
+        # PX4 needs to see the setpoint stream before accepting mode switch.
+        # Publish a few messages first.
+        for _ in range(10):
+            self._publish_offboard()
+
+        # Send mode switch command: VEHICLE_CMD_DO_SET_MODE
+        msg = VehicleCommand()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        msg.command = 176   # VEHICLE_CMD_DO_SET_MODE
+        msg.param1 = 1.0   # MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+        msg.param2 = 6.0   # PX4_CUSTOM_MAIN_MODE_OFFBOARD
+        msg.param3 = 0.0
+        msg.param4 = 0.0
+        msg.param5 = 0.0
+        msg.param6 = 0.0
+        msg.param7 = 0.0
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        self.vehicle_cmd_pub.publish(msg)
+
+        self.offboard_active = True
+        self.get_logger().info(
+            f'Offboard started — hold pos N:{self.offboard_pos[0]:.1f} '
+            f'E:{self.offboard_pos[1]:.1f} D:{self.offboard_pos[2]:.1f} '
+            f'yaw:{math.degrees(self.offboard_yaw):.1f}°')
+
+    def _publish_offboard(self):
+        """Publish offboard heartbeat + trajectory setpoint (every frame)."""
+        if self.offboard_pos is None:
+            return
+
+        # Heartbeat — tells PX4 we're alive and controlling position
+        mode_msg = OffboardControlMode()
+        mode_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        mode_msg.position = True
+        mode_msg.velocity = False
+        mode_msg.acceleration = False
+        mode_msg.attitude = False
+        mode_msg.body_rate = False
+        self.offboard_mode_pub.publish(mode_msg)
+
+        # Position + yaw setpoint
+        sp_msg = TrajectorySetpoint()
+        sp_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        sp_msg.position = [float(self.offboard_pos[0]),
+                           float(self.offboard_pos[1]),
+                           float(self.offboard_pos[2])]
+        sp_msg.velocity = [float('nan')] * 3
+        sp_msg.acceleration = [float('nan')] * 3
+        sp_msg.jerk = [float('nan')] * 3
+        sp_msg.yaw = float(self.offboard_yaw)
+        sp_msg.yawspeed = float('nan')
+        self.trajectory_pub.publish(sp_msg)
+
+    def _update_drone_control(self, now):
+        """Update offboard setpoints based on gimbal state.
+
+        A) Yaw: always correct drone heading toward gimbal target.
+           cmd_yaw > 0 → gimbal pointing right → yaw drone right.
+        B) Position: during TRACKING, fly forward/back to maintain ideal
+           gimbal pitch angle (-55°).
+        """
+        dt = now - self.last_frame_time if self.last_frame_time > 0 else 0.033
+        dt = min(dt, 0.2)  # cap to avoid jumps
+
+        # ── A) Yaw correction (always active) ──────────────────────
+        yaw_delta = DRONE_YAW_Kp * self.cmd_yaw * dt
+        self.offboard_yaw += yaw_delta
+        # Wrap to [-pi, pi]
+        self.offboard_yaw = math.atan2(math.sin(self.offboard_yaw),
+                                        math.cos(self.offboard_yaw))
+
+        # ── B) Position following (TRACKING only) ──────────────────
+        speed = 0.0
+        if self.state == State.TRACKING:
+            pitch_error = self.cmd_pitch - IDEAL_TRACK_PITCH
+            # pitch_error > 0: pitch shallower → car far away → fly forward
+            # pitch_error < 0: pitch steeper → car below → slow/back up
+            speed = PITCH_FOLLOW_GAIN * pitch_error
+            speed = max(-1.0, min(DRONE_FOLLOW_SPEED_MAX, speed))
+
+            # Move in drone's facing direction
+            vn = speed * math.cos(self.offboard_yaw)
+            ve = speed * math.sin(self.offboard_yaw)
+            self.offboard_pos[0] += vn * dt
+            self.offboard_pos[1] += ve * dt
+            # offboard_pos[2] stays constant (altitude hold)
+
+        return speed
+
     # ── Gimbal feedback from PX4 ───────────────────────────────
 
     def _on_gimbal_attitude(self, msg):
@@ -263,6 +387,7 @@ class GimbalTracker(Node):
     def _on_local_position(self, msg):
         """Callback: drone NED position from PX4."""
         self.drone_pos = (msg.x, msg.y, msg.z)
+        self.drone_heading = msg.heading  # NED yaw in radians
 
     # ── Camera frame processing ────────────────────────────────
 
@@ -323,10 +448,11 @@ class GimbalTracker(Node):
                 self.cmd_pitch = SEARCH_PITCH
                 self.cmd_yaw = SEARCH_YAW
                 self.state = State.SEARCHING
+                self._start_offboard()
                 self.get_logger().info(
                     f'Drone stable at position for {dwell:.0f}s — '
                     f'gimbal set to P:{math.degrees(SEARCH_PITCH):.0f} '
-                    f'Y:0 — SEARCHING')
+                    f'Y:0 — SEARCHING (offboard)')
             else:
                 if (SAVE_FRAMES and
                         SAVE_FRAME_START <= self.frame_num <= SAVE_FRAME_END):
@@ -363,6 +489,7 @@ class GimbalTracker(Node):
         log_err_ang_x = log_err_ang_y = 0.0
         log_target_yaw = self.cmd_yaw
         log_target_pitch = self.cmd_pitch
+        log_drone_speed = 0.0
 
         # ── State machine ──────────────────────────────────────
         if target is not None:
@@ -399,6 +526,7 @@ class GimbalTracker(Node):
                         self.get_logger().info('Target acquired — tracking.')
                 else:
                     self.acquiring_count = 0
+
         else:
             # No target — keep sending search pose during SEARCHING
             if self.state == State.SEARCHING:
@@ -418,6 +546,11 @@ class GimbalTracker(Node):
                         self.state = State.SEARCHING
                         self.get_logger().info('Returned to search pose.')
 
+        # ── Drone flight control (offboard — every frame) ───────
+        if self.offboard_active:
+            log_drone_speed = self._update_drone_control(now)
+            self._publish_offboard()
+
         # ── CSV log ────────────────────────────────────────────
         self.log_writer.writerow([
             self.frame_num, f'{now:.3f}', self.state.name,
@@ -432,9 +565,13 @@ class GimbalTracker(Node):
             f'{self.actual_yaw:.4f}', f'{self.actual_pitch:.4f}',
             f'{math.degrees(self.actual_yaw):.1f}',
             f'{math.degrees(self.actual_pitch):.1f}',
+            f'{math.degrees(self.offboard_yaw):.1f}',
+            f'{log_drone_speed:.2f}',
         ])
         if self.frame_num % 50 == 0:
             self.log_file.flush()
+
+        self.last_frame_time = now
 
         # ── Save frames ───────────────────────────────────────
         if (SAVE_FRAMES and
@@ -557,6 +694,13 @@ class GimbalTracker(Node):
             angle_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
         cv2.putText(frame, angle_text, (w - text_size[0] - 10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        # Offboard flight info
+        if self.offboard_active:
+            yaw_deg = math.degrees(self.offboard_yaw)
+            cv2.putText(frame, f'OFB yaw:{yaw_deg:+.0f}',
+                        (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 200, 255), 1)
 
         if target is not None:
             tcx, tcy, x1, y1, x2, y2, conf = target
